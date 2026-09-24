@@ -64,7 +64,7 @@ jobs:
               --title "Cloud images" \
               --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo || 'Tencent/WeKnora' }} by the Build cloud images workflow."
           fi
-          echo "release: ​https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "release: https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
 
   app:
     name: app image (linux/amd64)
@@ -141,8 +141,8 @@ jobs:
           {
             echo "### app image"
             echo "- tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
-            echo "- direct: ​https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
-            echo "- via proxy: ​https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
           } >> "$GITHUB_STEP_SUMMARY"
 
   ui:
@@ -211,7 +211,6 @@ jobs:
           {
             echo "### ui image"
             echo "- tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
-            echo "- direct: ​https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
-            echo "- via proxy: ​https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
           } >> "$GITHUB_STEP_SUMMARY"
-​
