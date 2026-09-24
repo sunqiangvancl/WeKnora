@@ -1,0 +1,214 @@
+# Build the WeKnora app + ui images for the Tencent Cloud box (linux/amd64 only)
+# and publish them as release assets: the box downloads them via ghfast.top and
+# runs `docker load`. No registry and no Docker Hub credentials are involved.
+#
+# Canonical copy: <fork>/.github/workflows/build-cloud-images.yml
+# Reference copy on the box: /root/weknoraOPS/workflows/build-cloud-images.yml
+name: Build cloud images (release assets)
+
+on:
+  # Editing this file re-runs the build, so iterating needs no UI click
+  # (fork Actions must still be enabled once, by hand, on the fork).
+  push:
+    paths:
+      - ".github/workflows/build-cloud-images.yml"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository to build (owner/name)"
+        required: true
+        default: "Tencent/WeKnora"
+      source_ref:
+        description: "Commit sha, branch or tag to build"
+        required: true
+        default: "1fa915d712288902da7841dc8ff355a56e37a013"
+      release_tag:
+        description: "Release tag that holds the image tarballs"
+        required: true
+        default: "cloud-images"
+      with_anydoc:
+        description: "WITH_ANYDOC for the app image (1=on, 0=off)"
+        required: true
+        default: "1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ensure the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag }}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $tag already exists"
+          else
+            gh release create "$tag" --repo "${{ github.repository }}" --latest=false \
+              --title "Cloud images" \
+              --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo }} by the Build cloud images workflow."
+          fi
+          echo "release: https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
+
+  app:
+    name: app image (linux/amd64)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+
+      - name: Resolve version info
+        id: v
+        run: |
+          set -euo pipefail
+          full="$(git rev-parse HEAD)"
+          short="${full:0:7}"
+          version="$(cat VERSION 2>/dev/null | tr -d '\n\r' || true)"
+          [ -n "$version" ] || version="unknown"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+          echo "resolved: $full (short $short, version $version)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build app image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.app
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}
+          build-args: |
+            VERSION_ARG=${{ steps.v.outputs.version }}
+            COMMIT_ID_ARG=${{ steps.v.outputs.short }}
+            BUILD_TIME_ARG=${{ steps.v.outputs.build_time }}
+            GO_VERSION_ARG=go1.26-bookworm
+            WITH_ANYDOC=${{ inputs.with_anydoc }}
+          cache-from: type=gha,scope=cloud-app
+          cache-to: type=gha,scope=cloud-app,mode=max
+
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          name="weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          docker save "wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
+          sha256sum "$name" > SHA256SUMS-app.txt
+          {
+            echo "source_repo: ${{ inputs.source_repo }}"
+            echo "source_ref_requested: ${{ inputs.source_ref }}"
+            echo "resolved_sha: ${{ steps.v.outputs.full }}"
+            echo "image_tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
+            echo "with_anydoc: ${{ inputs.with_anydoc }}"
+            echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > MANIFEST-app.txt
+          ls -lh "$name"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag }}"
+          gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
+            "weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz" SHA256SUMS-app.txt MANIFEST-app.txt
+          {
+            echo "### app image"
+            echo "- tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
+            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ui:
+    name: ui image (linux/amd64)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+
+      - name: Resolve version info
+        id: v
+        run: |
+          set -euo pipefail
+          full="$(git rev-parse HEAD)"
+          short="${full:0:7}"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "resolved: $full (short $short)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ui image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: frontend/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}
+          build-args: |
+            VITE_FRONTEND_COMMIT=${{ steps.v.outputs.short }}
+          cache-from: type=gha,scope=cloud-ui
+          cache-to: type=gha,scope=cloud-ui,mode=max
+
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          name="weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          docker save "wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
+          sha256sum "$name" > SHA256SUMS-ui.txt
+          {
+            echo "source_repo: ${{ inputs.source_repo }}"
+            echo "source_ref_requested: ${{ inputs.source_ref }}"
+            echo "resolved_sha: ${{ steps.v.outputs.full }}"
+            echo "image_tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
+            echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > MANIFEST-ui.txt
+          ls -lh "$name"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag }}"
+          gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
+            "weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz" SHA256SUMS-ui.txt MANIFEST-ui.txt
+          {
+            echo "### ui image"
+            echo "- tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
+            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          } >> "$GITHUB_STEP_SUMMARY"
