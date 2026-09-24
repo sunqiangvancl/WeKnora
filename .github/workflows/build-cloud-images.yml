@@ -4,11 +4,13 @@
 #
 # Canonical copy: <fork>/.github/workflows/build-cloud-images.yml
 # Reference copy on the box: /root/weknoraOPS/workflows/build-cloud-images.yml
+#
+# A push-triggered run has an empty `inputs` context, so every input is
+# repeated inline as `inputs.X || '<default>'`; keep the two in sync.
 name: Build cloud images (release assets)
 
 on:
-  # Editing this file re-runs the build, so iterating needs no UI click
-  # (fork Actions must still be enabled once, by hand, on the fork).
+  # Editing this file re-runs the build, so iterating needs no UI click.
   push:
     paths:
       - ".github/workflows/build-cloud-images.yml"
@@ -54,15 +56,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.release_tag }}"
+          tag="${{ inputs.release_tag || 'cloud-images' }}"
           if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "release $tag already exists"
           else
             gh release create "$tag" --repo "${{ github.repository }}" --latest=false \
               --title "Cloud images" \
-              --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo }} by the Build cloud images workflow."
+              --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo || 'Tencent/WeKnora' }} by the Build cloud images workflow."
           fi
-          echo "release: https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "release: ​https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
 
   app:
     name: app image (linux/amd64)
@@ -70,11 +72,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Checkout ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+      - name: Checkout ${{ inputs.source_repo || 'Tencent/WeKnora' }}@${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
         uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.source_ref }}
+          repository: ${{ inputs.source_repo || 'Tencent/WeKnora' }}
+          ref: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
 
       - name: Resolve version info
         id: v
@@ -107,7 +109,7 @@ jobs:
             COMMIT_ID_ARG=${{ steps.v.outputs.short }}
             BUILD_TIME_ARG=${{ steps.v.outputs.build_time }}
             GO_VERSION_ARG=go1.26-bookworm
-            WITH_ANYDOC=${{ inputs.with_anydoc }}
+            WITH_ANYDOC=${{ inputs.with_anydoc || '1' }}
           cache-from: type=gha,scope=cloud-app
           cache-to: type=gha,scope=cloud-app,mode=max
 
@@ -118,11 +120,11 @@ jobs:
           docker save "wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
           sha256sum "$name" > SHA256SUMS-app.txt
           {
-            echo "source_repo: ${{ inputs.source_repo }}"
-            echo "source_ref_requested: ${{ inputs.source_ref }}"
+            echo "source_repo: ${{ inputs.source_repo || 'Tencent/WeKnora' }}"
+            echo "source_ref_requested: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}"
             echo "resolved_sha: ${{ steps.v.outputs.full }}"
             echo "image_tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
-            echo "with_anydoc: ${{ inputs.with_anydoc }}"
+            echo "with_anydoc: ${{ inputs.with_anydoc || '1' }}"
             echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           } > MANIFEST-app.txt
@@ -133,14 +135,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.release_tag }}"
+          tag="${{ inputs.release_tag || 'cloud-images' }}"
           gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
             "weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz" SHA256SUMS-app.txt MANIFEST-app.txt
           {
             echo "### app image"
             echo "- tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
-            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
-            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- direct: ​https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: ​https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-app-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
           } >> "$GITHUB_STEP_SUMMARY"
 
   ui:
@@ -149,11 +151,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+      - name: Checkout ${{ inputs.source_repo || 'Tencent/WeKnora' }}@${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
         uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.source_ref }}
+          repository: ${{ inputs.source_repo || 'Tencent/WeKnora' }}
+          ref: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
 
       - name: Resolve version info
         id: v
@@ -189,8 +191,8 @@ jobs:
           docker save "wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
           sha256sum "$name" > SHA256SUMS-ui.txt
           {
-            echo "source_repo: ${{ inputs.source_repo }}"
-            echo "source_ref_requested: ${{ inputs.source_ref }}"
+            echo "source_repo: ${{ inputs.source_repo || 'Tencent/WeKnora' }}"
+            echo "source_ref_requested: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}"
             echo "resolved_sha: ${{ steps.v.outputs.full }}"
             echo "image_tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
             echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -203,12 +205,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.release_tag }}"
+          tag="${{ inputs.release_tag || 'cloud-images' }}"
           gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
             "weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz" SHA256SUMS-ui.txt MANIFEST-ui.txt
           {
             echo "### ui image"
             echo "- tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
-            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
-            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- direct: ​https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: ​https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
           } >> "$GITHUB_STEP_SUMMARY"
+​
