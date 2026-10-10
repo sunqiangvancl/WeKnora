@@ -121,6 +121,14 @@
                       <t-icon name="edit" class="menu-icon" />
                       <span>{{ t('knowledgeBase.folderTree.rename') }}</span>
                     </div>
+                    <div
+                      v-if="isDeletableFolder(row)"
+                      class="popup-menu-item"
+                      @click="onFolderMenuDelete(row)"
+                    >
+                      <t-icon name="delete" class="menu-icon" />
+                      <span>{{ t('knowledgeBase.folderTree.delete') }}</span>
+                    </div>
                   </div>
                 </template>
               </t-popup>
@@ -163,6 +171,7 @@ const emit = defineEmits<{
   select: [path: string]
   'update:collapsed': [collapsed: boolean]
   rename: [payload: { from: string; to: string }]
+  'delete-folder': [path: string]
 }>()
 
 const { t } = useI18n()
@@ -207,6 +216,16 @@ const onFolderMenuVisible = (path: string, visible: boolean) => {
 const onFolderMenuRename = async (row: FolderRow) => {
   menuOpenPath.value = null
   await startRename(row)
+}
+
+// The mirror of the server's rule: deletable only when nothing lives under the
+// path, sub-folders included. A folder holding only sub-folders is not empty.
+const isDeletableFolder = (row: FolderRow) =>
+  row.kind === 'folder' && !row.hasChildren && row.documentCount === 0 && row.totalCount === 0
+
+const onFolderMenuDelete = (row: FolderRow) => {
+  menuOpenPath.value = null
+  emit('delete-folder', row.path)
 }
 
 const cancelRename = () => {

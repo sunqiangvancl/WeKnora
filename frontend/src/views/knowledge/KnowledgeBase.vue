@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, reactive, computed, nextTick } from "vue";
-import { MessagePlugin } from "tdesign-vue-next";
+import { MessagePlugin, DialogPlugin } from "tdesign-vue-next";
 import DocContent from "@/components/doc-content.vue";
 import useKnowledgeBase from '@/hooks/useKnowledgeBase';
 import { useRoute, useRouter } from 'vue-router';
@@ -37,6 +37,8 @@ import {
   listKnowledgeFolders,
   moveKnowledgeToFolder,
   renameKnowledgeFolder,
+  createKnowledgeFolder,
+  deleteKnowledgeFolder,
   downKnowledgeDetails,
   type KnowledgeFolderTree,
 } from "@/api/knowledge-base/index";
@@ -69,6 +71,7 @@ import {
   folderBreadcrumbs as buildFolderBreadcrumbs,
   folderPathExists as folderExistsInTree,
   isFilteringDocuments,
+  joinFolderPath,
   ROOT_FOLDER_PATH,
 } from './folderTree';
 import {
@@ -939,6 +942,52 @@ const handleFolderRename = async ({ from, to }: { from: string; to: string }) =>
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('knowledgeBase.folderTree.renameFailed'));
   }
+};
+
+const handleCreateFolder = async (name: string) => {
+  if (!kbId.value) return;
+  const path = joinFolderPath(selectedFolderPath.value, name.trim());
+  if (!path) {
+    MessagePlugin.warning(t('knowledgeBase.folderTree.createInvalid'));
+    return;
+  }
+  try {
+    await createKnowledgeFolder(kbId.value, path);
+    MessagePlugin.success(t('knowledgeBase.folderTree.createSuccess'));
+    // Stay inside the folder that was just made, the way an upload does.
+    selectedFolderPath.value = path;
+    resetPage();
+    await loadKnowledgeFiles(kbId.value);
+    await loadFolderTree(kbId.value);
+  } catch (error: any) {
+    MessagePlugin.error(error?.message || t('knowledgeBase.folderTree.createFailed'));
+  }
+};
+
+const handleDeleteFolder = async (path: string) => {
+  if (!kbId.value || !path) return;
+  const dialog = DialogPlugin.confirm({
+    header: t('knowledgeBase.folderTree.delete'),
+    body: t('knowledgeBase.folderTree.deleteConfirm', { folder: path }),
+    confirmBtn: t('common.confirm'),
+    cancelBtn: t('common.cancel'),
+    onConfirm: async () => {
+      dialog.destroy();
+      try {
+        await deleteKnowledgeFolder(kbId.value, path);
+        MessagePlugin.success(t('knowledgeBase.folderTree.deleteSuccess'));
+        const cut = path.lastIndexOf('/');
+        const parent = cut === -1 ? ROOT_FOLDER_PATH : path.slice(0, cut);
+        if (selectedFolderPath.value === path) selectedFolderPath.value = parent;
+        resetPage();
+        await loadKnowledgeFiles(kbId.value);
+        await loadFolderTree(kbId.value);
+      } catch (error: any) {
+        MessagePlugin.error(error?.message || t('knowledgeBase.folderTree.deleteFailed'));
+      }
+    },
+    onCancel: () => dialog.destroy(),
+  });
 };
 
 const handleFolderTreeCollapsedChange = (value: boolean) => {
@@ -2321,7 +2370,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
           <KbFolderTree v-if="showFolderTree && !folderTreeCollapsed" :tree="folderTree" :selected-path="selectedFolderPath"
             :loading="folderTreeLoading" :can-edit="canEdit" :root-label="kbInfo?.name"
             @select="handleFolderSelect" @update:collapsed="handleFolderTreeCollapsedChange"
-            @rename="handleFolderRename" />
+            @rename="handleFolderRename" @delete-folder="handleDeleteFolder" />
           <div class="tag-content">
             <div class="doc-card-area">
               <div class="doc-filter-bar">
@@ -2465,10 +2514,10 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                   </div>
                   <div v-if="canEdit" class="doc-filter-actions">
                     <KbUploadSourceDropdown ref="uploadSourceRef" :accept-file-types="acceptFileTypes"
-                      :supported-file-types="[...supportedFileTypes]" include-manual trigger-icon="add" :trigger-label="t('knowledgeBase.addDocument')"
+                      :supported-file-types="[...supportedFileTypes]" include-manual include-folder trigger-icon="add" :trigger-label="t('knowledgeBase.addDocument')"
                       trigger-class="content-bar-icon-btn" data-guide="kb-detail-add-doc"
                       :tooltip="t('knowledgeBase.addDocument')" placement="bottom-right" @files="handleUploadSourceFiles"
-                      @url="handleUploadSourceUrl" @manual="handleManualCreate" />
+                      @url="handleUploadSourceUrl" @manual="handleManualCreate" @folder="handleCreateFolder" />
                   </div>
                 </div>
               </div>

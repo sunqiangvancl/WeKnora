@@ -372,6 +372,28 @@ export function renameKnowledgeFolder(kbId: string, from: string, to: string) {
   return put(`/api/v1/knowledge-bases/${kbId}/knowledge/folders`, { from, to });
 }
 
+/**
+ * Register a folder that holds nothing yet. Uploaded paths already appear in
+ * the tree on their own; this is the only way to get a row for a path with no
+ * documents under it. `folderPath` is the canonical path, e.g. "docs/spec".
+ */
+export function createKnowledgeFolder(kbId: string, folderPath: string) {
+  return post(`/api/v1/knowledge-bases/${kbId}/knowledge/folders`, {
+    folder_path: folderPath,
+  });
+}
+
+/**
+ * Drop a registered folder. Rejected when documents still live below the path
+ * or when it has registered children -- an "empty" folder is one with neither,
+ * so a folder holding only sub-folders is not empty.
+ */
+export function deleteKnowledgeFolder(kbId: string, folderPath: string) {
+  return del(
+    `/api/v1/knowledge-bases/${kbId}/knowledge/folders?folder_path=${encodeURIComponent(folderPath)}`,
+  );
+}
+
 export function getKnowledgeDetails(id: string, options?: { agent_id?: string; agent_source_tenant_id?: string }) {
   const query = new URLSearchParams();
   if (options?.agent_id) query.set('agent_id', options.agent_id);

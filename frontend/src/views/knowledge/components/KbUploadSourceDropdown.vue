@@ -62,6 +62,28 @@
         <div class="url-input-tip">{{ t('knowledgeBase.urlTip') }}</div>
       </div>
     </t-dialog>
+
+    <t-dialog
+      v-model:visible="folderDialogVisible"
+      :header="t('knowledgeBase.folderTree.createTitle')"
+      :confirm-btn="{ content: t('common.confirm'), theme: 'primary' }"
+      :cancel-btn="{ content: t('common.cancel') }"
+      width="500px"
+      @confirm="handleFolderDialogConfirm"
+      @cancel="handleFolderDialogCancel"
+    >
+      <div class="url-import-form">
+        <div class="url-input-label">{{ t('knowledgeBase.folderTree.createNameLabel') }}</div>
+        <t-input
+          v-model="folderNameValue"
+          :placeholder="t('knowledgeBase.folderTree.createNamePlaceholder')"
+          clearable
+          autofocus
+          @enter="handleFolderDialogConfirm"
+        />
+        <div class="url-input-tip">{{ t('knowledgeBase.folderTree.createNameTip') }}</div>
+      </div>
+    </t-dialog>
   </div>
 </template>
 
@@ -76,6 +98,7 @@ const props = withDefaults(defineProps<{
   acceptFileTypes?: string
   supportedFileTypes?: string[]
   includeManual?: boolean
+  includeFolder?: boolean
   triggerIcon?: string
   triggerLabel?: string
   triggerClass?: string
@@ -86,6 +109,7 @@ const props = withDefaults(defineProps<{
   acceptFileTypes: '',
   supportedFileTypes: () => [],
   includeManual: false,
+  includeFolder: false,
   triggerIcon: 'file-add',
   triggerClass: '',
   dataGuide: '',
@@ -97,6 +121,7 @@ const emit = defineEmits<{
   files: [files: File[]]
   url: [url: string]
   manual: []
+  folder: [name: string]
 }>()
 
 const { t } = useI18n()
@@ -105,6 +130,8 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null)
 const urlDialogVisible = ref(false)
 const urlInputValue = ref('')
+const folderDialogVisible = ref(false)
+const folderNameValue = ref('')
 
 const tooltipText = computed(() => props.tooltip || t('knowledgeBase.addDocument'))
 
@@ -128,6 +155,13 @@ const dropdownOptions = computed(() => {
       value: 'uploadFolder',
       prefixIcon: () => h(FolderAddIcon, sourceIconProps),
     },
+    ...(props.includeFolder
+      ? [{
+          content: t('knowledgeBase.folderTree.create'),
+          value: 'createFolder',
+          prefixIcon: () => h(FolderAddIcon, sourceIconProps),
+        }]
+      : []),
     {
       content: t('knowledgeBase.importURL'),
       value: 'importURL',
@@ -151,6 +185,10 @@ const handleActionSelect = (data: { value: string }) => {
       break
     case 'uploadFolder':
       folderInputRef.value?.click()
+      break
+    case 'createFolder':
+      folderNameValue.value = ''
+      folderDialogVisible.value = true
       break
     case 'importURL':
       urlInputValue.value = ''
@@ -221,6 +259,22 @@ const handleUrlDialogConfirm = () => {
 const handleUrlDialogCancel = () => {
   urlDialogVisible.value = false
   urlInputValue.value = ''
+}
+
+const handleFolderDialogConfirm = () => {
+  const name = folderNameValue.value.trim()
+  if (!name) {
+    MessagePlugin.warning(t('knowledgeBase.folderTree.createInvalid'))
+    return
+  }
+  folderDialogVisible.value = false
+  folderNameValue.value = ''
+  emit('folder', name)
+}
+
+const handleFolderDialogCancel = () => {
+  folderDialogVisible.value = false
+  folderNameValue.value = ''
 }
 
 const openUrlDialog = () => {
