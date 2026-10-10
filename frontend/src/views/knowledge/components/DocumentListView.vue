@@ -266,7 +266,7 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
 <template>
   <div class="doc-list-view" :class="{ 'is-loading': loading }" role="table" :aria-label="t('knowledgeEditor.document.title')">
     <div ref="stickySentinel" class="doc-list-sticky-sentinel" aria-hidden="true"></div>
-    <div class="doc-list-header" :class="{ 'is-stuck': headerStuck }" role="row">
+    <div class="doc-list-header" :class="{ 'is-stuck': headerStuck, 'has-path': showFolderPath }" role="row">
       <div class="cell cell-check" role="columnheader" @click.stop>
         <t-checkbox v-if="canEdit || canDownload" class="doc-list-check" size="small" :checked="allSelected" :indeterminate="someSelected"
           :disabled="!items.length" :title="t('knowledgeBase.selectAll')" @change="onHeaderCheckboxChange" />
@@ -280,7 +280,8 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
 
     <div class="doc-list-body" role="rowgroup">
       <div v-for="item in items" :key="item.id" class="doc-list-row"
-        :class="{ selected: selectedIds.has(item.id), 'menu-open': moreOpen === item.id }" :data-select-id="item.id"
+        :class="{ selected: selectedIds.has(item.id), 'menu-open': moreOpen === item.id, 'has-path': showFolderPath }"
+        :data-select-id="item.id"
         role="row" @click="emit('open', item)">
         <div class="cell cell-check" role="cell" @click.stop>
           <t-checkbox v-if="canEdit || canDownload" class="doc-list-check" size="small" :checked="selectedIds.has(item.id)" :title="item.file_name"
@@ -483,10 +484,20 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
 .doc-list-header,
 .doc-list-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) minmax(140px, 18%) minmax(180px, 24%) 100px 28px;
+  grid-template-columns: 24px minmax(0, 1fr) minmax(180px, 24%) 100px 28px;
   align-items: center;
   column-gap: 12px;
   padding: 0 8px;
+}
+
+/* The extra path track exists only when the path cells do. The header cell and
+   every row cell carry v-if="showFolderPath", so an unconditional six-track
+   template would leave a folderless knowledge base with five cells in six tracks:
+   tags pulled into the path column's share, the fixed 100px status track widened
+   to a quarter of the panel, and the kebab's 28px track empty beside a stray gap. */
+.doc-list-header.has-path,
+.doc-list-row.has-path {
+  grid-template-columns: 24px minmax(0, 1fr) minmax(140px, 18%) minmax(180px, 24%) 100px 28px;
 }
 
 .doc-list-sticky-sentinel {
@@ -793,7 +804,14 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
   border-radius: var(--app-radius-xs);
 }
 @container doc-card-area (max-width: 720px) {
-  .doc-list-header, .doc-list-row {
+  /* The four-track narrow layout has to win in BOTH cases, so it restates the
+     gated pair as well: @container adds no specificity, and a bare (0,1,0) rule
+     would lose to `.doc-list-header.has-path` (0,2,0) above no matter where it
+     sits, leaving six tracks and an empty one in a 720px panel. */
+  .doc-list-header,
+  .doc-list-row,
+  .doc-list-header.has-path,
+  .doc-list-row.has-path {
     grid-template-columns: 24px minmax(0, 1fr) 100px 28px;
     column-gap: 8px;
   }
