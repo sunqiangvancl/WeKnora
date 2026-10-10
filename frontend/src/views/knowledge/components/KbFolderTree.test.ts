@@ -52,3 +52,14 @@ test('folder navigation cancels stale card hover popovers', () => {
   assert.match(cardView, /const onOpenFolder = \(path: string\)[\s\S]*?dismissCardPopover\(\)[\s\S]*?emit\('open-folder', path\)/)
   assert.match(cardView, /@click\.stop="onOpenFolder\(item\.folder_path\)"/)
 })
+
+// The badge answers "how much does this folder hold", which is the whole subtree.
+// The server already rolls it up into total_count; the row used to render the
+// single-level value instead, so a parent with 226 docs underneath showed "2".
+test('the folder count badge shows the subtree total', () => {
+  assert.match(
+    tree,
+    /class="kb-folder-row__count"[\s\S]{0,300}?\{\{ row\.totalCount \}\}/,
+  )
+  assert.doesNotMatch(tree, /\{\{ row\.documentCount \}\}/)
+})
