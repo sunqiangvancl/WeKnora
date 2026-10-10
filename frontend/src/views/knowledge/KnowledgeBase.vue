@@ -768,8 +768,8 @@ const hasFolders = computed(() => (folderTree.value?.folders?.length ?? 0) > 0);
 // The folder column only earns its space once the knowledge base actually has
 // folders, so knowledge bases filled with single-file uploads look unchanged.
 const showFolderTree = computed(() => !isFAQ.value && hasFolders.value);
-// Browsing lists one folder's own contents; filtering searches its whole
-// subtree. There is no mode switch: the list follows what the user is doing.
+// Both browsing and filtering span the whole subtree. isFiltering only picks
+// the header wording and the empty state; it never changes the query scope.
 const isFiltering = computed(() =>
   isFilteringDocuments({
     keyword: docSearchKeyword.value,
@@ -796,8 +796,8 @@ const filterParams = computed(() => {
     end_time: end ? `${end} 23:59:59` : undefined,
     ...getDocumentSortParams(selectedDocumentSort.value),
     folder_path: selectedFolderPath.value,
-    // Filtering searches descendants; browsing shows this folder's documents.
-    folder_recursive: isFiltering.value,
+    // Browsing spans the whole subtree, so the badge and this list agree.
+    folder_recursive: true,
   };
 });
 

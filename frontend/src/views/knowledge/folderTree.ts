@@ -169,19 +169,13 @@ export function childFolders(
 }
 
 /**
- * Whether the document list is filtering rather than browsing.
+ * Whether the document list has any filter active.
  *
- * This is the single input that decides how a folder selection is read, and it
- * comes from what the user is already doing instead of from a mode switch they
- * have to understand:
- *
- * - Browsing (no filter active) lists the selected folder's own contents — its
- *   sub-folders as entries plus the documents directly inside it, the way a file
- *   manager does. A document uploaded on its own therefore sits at the top level
- *   next to the folders, which is exactly where it belongs.
- * - Filtering searches the selected folder and everything below it, returning a
- *   flat result set, because a search that stopped at one level would hide
- *   matches for no good reason.
+ * Copy only, never scope: it decides how the list header counts itself
+ * ("N documents" vs "N matching documents") and which empty state the user sees.
+ * Browsing a folder and filtering inside it now ask the server for the same thing
+ * — the whole subtree — so a folder's badge and the documents listed next to it
+ * always agree. There is no browse/search split left to describe.
  */
 export function isFilteringDocuments(filters: {
   keyword?: string

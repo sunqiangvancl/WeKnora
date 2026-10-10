@@ -321,7 +321,10 @@ export interface ListKnowledgeFilesParams {
    * 当前浏览的目录。空字符串表示知识库根目录；未定义时不按目录筛选。
    */
   folder_path?: string;
-  /** 是否同时包含 folder_path 下所有子目录中的文档。 */
+  /**
+   * 是否同时包含 folder_path 下所有子目录中的文档。
+   * Web UI 浏览与筛选都恒传 true；服务端默认仍是 false（保持 SDK/CLI 兼容）。
+   */
   folder_recursive?: boolean;
 }
 
