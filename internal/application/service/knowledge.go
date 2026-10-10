@@ -628,7 +628,15 @@ func (s *knowledgeService) ListKnowledgeFolderTree(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	return types.BuildKnowledgeFolderTree(counts), nil
+	// Union with the registry so folders created without a document still show
+	// up. Nothing is back-filled: a projected folder needs no row, and a write
+	// path that never registers a path cannot "lose" a folder.
+	registered, err := s.repo.ListRegisteredFolderPaths(ctx,
+		ctx.Value(types.TenantIDContextKey).(uint64), kbID)
+	if err != nil {
+		return nil, err
+	}
+	return types.BuildKnowledgeFolderTree(types.MergeRegisteredFolders(counts, registered)), nil
 }
 
 // MoveKnowledgeToFolder re-files knowledge entries under folderPath. Since

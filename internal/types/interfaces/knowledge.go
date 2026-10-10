@@ -99,6 +99,14 @@ type KnowledgeService interface {
 	) (int64, error)
 	// RenameKnowledgeFolder moves a folder and everything below it to a new path.
 	RenameKnowledgeFolder(ctx context.Context, kbID string, from string, to string) (int64, error)
+	// CreateKnowledgeFolder registers an empty folder so it appears in the tree
+	// without holding a document. Returns 409-class errors when the path already
+	// exists, whether registered or projected.
+	CreateKnowledgeFolder(ctx context.Context, kbID, folderPath string) (*types.KnowledgeFolder, error)
+	// DeleteKnowledgeFolder unregisters a folder that holds nothing: no document
+	// in its subtree and no registered child folder. Either one is refused with a
+	// message naming what is still inside.
+	DeleteKnowledgeFolder(ctx context.Context, kbID, folderPath string) error
 	// DeleteKnowledge deletes knowledge by ID.
 	DeleteKnowledge(ctx context.Context, id string) error
 	// DeleteKnowledgeList requires an explicit write grant for every affected KB.
@@ -298,6 +306,27 @@ type KnowledgeRepository interface {
 		from string,
 		to string,
 	) (int64, error)
+	// ListRegisteredFolderPaths returns the paths recorded in knowledge_folders,
+	// i.e. folders that exist without holding a document. They are unioned with
+	// ListKnowledgeFolderCounts so an empty folder stays visible in the tree.
+	ListRegisteredFolderPaths(ctx context.Context, tenantID uint64, kbID string) ([]string, error)
+	// FindRegisteredFolder returns the live registry row for an exact path, or
+	// nil when the folder is not registered. A projected folder has no row, which
+	// is what lets the delete path explain itself instead of saying "not empty".
+	FindRegisteredFolder(ctx context.Context, tenantID uint64, kbID, path string) (*types.KnowledgeFolder, error)
+	// CreateRegisteredFolder inserts a registry row for an already-normalized path.
+	CreateRegisteredFolder(ctx context.Context, folder *types.KnowledgeFolder) error
+	// DeleteRegisteredFolder soft-deletes one registry row, scoped by tenant and
+	// knowledge base so one KB's request cannot unregister another's folder.
+	DeleteRegisteredFolder(ctx context.Context, tenantID uint64, kbID, path string) error
+	// CountFolderSubtreeDocuments counts entries stored in path or below it, using
+	// the same exclusion as ListKnowledgeFolderCounts so the answer agrees with
+	// the number the sidebar is already showing.
+	CountFolderSubtreeDocuments(ctx context.Context, tenantID uint64, kbID, path string) (int64, error)
+	// ListRegisteredChildFolders returns registered folders directly below path.
+	// Only registered children are needed: a projected child implies a document
+	// below it, which CountFolderSubtreeDocuments already reports.
+	ListRegisteredChildFolders(ctx context.Context, tenantID uint64, kbID, path string) ([]string, error)
 	// AminusB returns the IDs of knowledge in A that have no counterpart in B,
 	// comparing file_hash as a multiset (so duplicate-count differences and
 	// NULL/empty hashes are handled correctly, letting a clone converge).

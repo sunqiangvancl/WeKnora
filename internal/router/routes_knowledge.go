@@ -78,6 +78,14 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		kbRead.POST("/batch-download", g.Contributor(), g.KBAccessWrite("id"), handler.BatchDownloadKnowledge)
 		kbRead.GET("/folders", g.Viewer(), g.KBAccessRead("id"), handler.ListKnowledgeFolders)
 		kb.PUT("/folders", g.OwnedKBOrAdmin(), g.KBAccessWrite("id"), handler.RenameKnowledgeFolder)
+		// Empty folders are the one thing the path projection cannot express: a
+		// folder is only visible while some document's folder_path mentions it.
+		// These two register and unregister a directory on its own, which is what
+		// "新建文件夹" needs. They inherit the group's ingest capability class so
+		// an API key can drive them too — the route gate alone is not enough, an
+		// unregistered route is refused by default (see the skills/catalog 403).
+		kb.POST("/folders", g.Contributor(), g.KBAccessWrite("id"), handler.CreateKnowledgeFolder)
+		kb.DELETE("/folders", g.Contributor(), g.KBAccessWrite("id"), handler.DeleteKnowledgeFolder)
 		// Clearing all contents under a KB is a destructive op; gate
 		// behind Admin instead of Contributor.
 		kb.With(apiKeyFullAccess()).DELETE("", g.Admin(), g.KBAccessWrite("id"), handler.ClearKnowledgeBaseContents)

@@ -342,6 +342,12 @@ func (r *knowledgeRepository) RenameKnowledgeFolderPath(
 			}
 			affected += result.RowsAffected
 		}
+		// The registry has to follow the documents. A rename that leaves registered
+		// rows on the old prefix makes the sidebar show a folder nothing lives
+		// under, which is the two-truths failure this whole table exists to avoid.
+		if _, err := renameRegisteredFolders(tx, tenantID, kbID, from, to); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
