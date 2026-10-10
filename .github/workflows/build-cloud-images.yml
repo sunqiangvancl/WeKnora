@@ -85,8 +85,9 @@ jobs:
     # Gate for both artifacts. Nothing has been compiled from this branch on the
     # cloud box (its Go is 1.25.8 against a go.mod that requires 1.26.0, and it
     # has no node/npm at all), so this job is the first real compile of the
-    # patch. Commands mirror .github/workflows/app.yml rather than inventing a
-    # second definition of "does the app build".
+    # patch and, since the frontend step below, also the only executor of the
+    # ui unit tests and i18n key parity. Commands mirror .github/workflows/app.yml
+    # rather than inventing a second definition of "does the app build".
     name: compile + folder tests
     needs: prepare
     runs-on: ubuntu-latest
@@ -124,12 +125,35 @@ jobs:
           go vet "${pkgs[@]}"
           go build ./cmd/server
 
+      # Frontend tests never ran anywhere: the build box has no node/npm, and the
+      # ui job only does `npm run build` inside Docker (syntax gate, not assertions).
+      # This round rewrites the browse/search contract in folderTree.test.ts and adds
+      # i18n keys, so without this step those edits are unverified.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Frontend unit tests and i18n key parity
+        working-directory: frontend
+        run: |
+          # pipefail: without it `npm test | tee` would let a red suite sail on
+          set -o pipefail
+          npm ci --no-audit --no-fund
+          npm test 2>&1 | tee /tmp/fe-test.log
+          # A green run that discovered zero tests is worse than no step at all:
+          # it reads as verification. Fail loudly instead.
+          grep -qE '^# (pass|tests) [1-9]' /tmp/fe-test.log || {
+            echo "FATAL: frontend test run reported no tests — node's default glob is not"
+            echo "       matching .ts under tsx. Switch to the explicit list below."
+            exit 1; }
+          npm run check-i18n
+
       - name: Folder unit tests
         shell: bash
         run: |
-          go test -count=1 ./internal/types/ -run 'Folder'
+          go test -count=1 ./internal/types/ -run 'Folder|Runtime'
           go test -count=1 ./internal/application/service/ -run 'Folder'
-          go test -count=1 ./internal/handler/ -run 'Folder'
+          go test -count=1 ./internal/handler/ -run 'Folder|Runtime'
 
       - name: Run migration 000900 up and down on real PostgreSQL
         # The migration is the only irreversible part of this patch, and it has
