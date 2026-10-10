@@ -146,6 +146,48 @@ jobs:
             echo "FATAL: frontend test run reported no tests — node's default glob is not"
             echo "       matching .ts under tsx. Switch to the explicit list below."
             exit 1; }
+          # ">=1 test ran" satisfies that guard but not the plan: Tasks 2-7 add
+          # assertions to four specific files, and if tsx's default glob quietly
+          # skips .ts every one of them goes green unverified. So keep the broad run
+          # for cover AND name those four explicitly. Each must show up as an
+          # executed file in the TAP output; one that does not is re-run on its own,
+          # and a file that executes zero tests fails this step.
+          targeted=(
+            src/views/knowledge/folderTree.test.ts
+            src/views/knowledge/components/KbFolderTree.test.ts
+            src/api/knowledge-base/knowledgeFileListQuery.test.ts
+            src/i18n/localeKeyAudit.test.ts
+          )
+          npx tsx --test "${targeted[@]}" 2>&1 | tee /tmp/fe-targeted.log
+          grep -qE '^# (pass|tests) [1-9]' /tmp/fe-targeted.log || {
+            echo "FATAL: the explicit four-file run discovered no tests."
+            exit 1; }
+          solo_reruns=0
+          for f in "${targeted[@]}"; do
+            if grep -qE "^# Subtest:.*${f##*/}\$" /tmp/fe-targeted.log; then
+              continue
+            fi
+            echo "NOTE: $f is not named in the combined TAP output; running it alone."
+            npx tsx --test "$f" 2>&1 | tee /tmp/fe-single.log
+            grep -qE '^# (pass|tests) [1-9]' /tmp/fe-single.log || {
+              echo "FATAL: $f exists but executed zero tests - Tasks 2-7 would edit it unverified."
+              exit 1; }
+            solo_reruns=$((solo_reruns + 1))
+          done
+          # Counts go to the step summary on purpose: the raw job-log endpoint answers
+          # 403 anonymously and the anonymous API quota is 60/hour, so "how many tests
+          # actually ran" has to be readable off the run's own web page.
+          tap() { awk -v k="$1" '$1 == "#" && $2 == k { v = $3 } END { print v }' "$2"; }
+          full_tests=$(tap tests /tmp/fe-test.log)
+          full_pass=$(tap pass /tmp/fe-test.log)
+          full_fail=$(tap fail /tmp/fe-test.log)
+          tgt_tests=$(tap tests /tmp/fe-targeted.log)
+          tgt_pass=$(tap pass /tmp/fe-targeted.log)
+          tgt_fail=$(tap fail /tmp/fe-targeted.log)
+          printf 'frontend_harness full_tests=%s full_pass=%s full_fail=%s tgt_tests=%s tgt_pass=%s tgt_fail=%s solo_reruns=%s\n' \
+            "${full_tests:-na}" "${full_pass:-na}" "${full_fail:-na}" \
+            "${tgt_tests:-na}" "${tgt_pass:-na}" "${tgt_fail:-na}" \
+            "$solo_reruns" >> "$GITHUB_STEP_SUMMARY"
           npm run check-i18n
 
       - name: Folder unit tests
