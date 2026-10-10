@@ -6999,6 +6999,7 @@ export default {
     viewModeList: 'Список',
     viewModeToggle: 'Переключить вид',
     columnName: 'Имя',
+    columnFolder: 'Путь',
     columnTag: 'Тег',
     columnSize: 'Размер',
     columnSource: 'Источник',

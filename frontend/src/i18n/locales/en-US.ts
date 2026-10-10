@@ -811,6 +811,7 @@ export default {
     viewModeList: 'List view',
     viewModeToggle: 'Toggle view',
     columnName: 'Name',
+    columnFolder: 'Path',
     columnTag: 'Tag',
     columnSize: 'Size',
     columnSource: 'Source',

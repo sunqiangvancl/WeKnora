@@ -6999,6 +6999,7 @@ export default {
     viewModeList: '목록 보기',
     viewModeToggle: '보기 전환',
     columnName: '파일 이름',
+    columnFolder: '경로',
     columnTag: '태그',
     columnSize: '크기',
     columnSource: '소스',

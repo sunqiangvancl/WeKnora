@@ -7001,6 +7001,7 @@ export default {
     viewModeList: '列表视图',
     viewModeToggle: '切换视图',
     columnName: '文件名',
+    columnFolder: '路径',
     columnTag: '标签',
     columnSize: '大小',
     columnSource: '来源',

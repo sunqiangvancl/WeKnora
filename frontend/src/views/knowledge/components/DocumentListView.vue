@@ -46,9 +46,10 @@ const props = defineProps<{
   /** Every folder of the knowledge base, for the "move to folder" picker. */
   folderOptions?: FolderOption[];
   /**
-   * Show each row's folder under its name. Only useful when the list spans
-   * several folders, i.e. while filtering; inside one folder the path would be
-   * identical on every row.
+   * Show each row's folder as its own column. Browsing a folder lists its whole
+   * subtree now, so one list routinely spans many folders and the path is what
+   * tells those rows apart; only a knowledge base with no folders at all can do
+   * without the column.
    */
   showFolderPath?: boolean;
   // Move sub-flow state
@@ -271,6 +272,7 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
           :disabled="!items.length" :title="t('knowledgeBase.selectAll')" @change="onHeaderCheckboxChange" />
       </div>
       <div class="cell cell-name" role="columnheader">{{ t('knowledgeBase.columnName') }}</div>
+      <div class="cell cell-path" role="columnheader" v-if="showFolderPath">{{ t('knowledgeBase.columnFolder') }}</div>
       <div class="cell cell-tags" role="columnheader">{{ t('knowledgeBase.columnTag') }}</div>
       <div class="cell cell-status" role="columnheader">{{ t('knowledgeBase.columnStatus') }}</div>
       <div class="cell cell-actions" role="columnheader" v-if="canEdit"></div>
@@ -302,12 +304,14 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
               <span class="meta-sep" aria-hidden="true">·</span>
               <span :title="t('knowledgeBase.columnUpdatedAt')">{{ formatTime(item.updated_at) }}</span>
             </span>
-            <button v-if="showFolderPath && item.folder_path" type="button" class="row-file-folder"
-              :title="item.folder_path" @click.stop="emit('open-folder', item.folder_path)">
-              <t-icon name="folder" />
-              <span>{{ item.folder_path }}</span>
-            </button>
           </div>
+        </div>
+
+        <div v-if="showFolderPath" class="cell cell-path" role="cell">
+          <button type="button" class="cell-path-btn" :title="item.folder_path"
+            @click.stop="emit('open-folder', item.folder_path)">
+            {{ item.folder_path || t('knowledgeBase.folderTree.rootRow') }}
+          </button>
         </div>
 
         <div class="cell cell-tags" role="cell">
@@ -479,7 +483,7 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
 .doc-list-header,
 .doc-list-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) minmax(180px, 24%) 100px 28px;
+  grid-template-columns: 24px minmax(0, 1fr) minmax(140px, 18%) minmax(180px, 24%) 100px 28px;
   align-items: center;
   column-gap: 12px;
   padding: 0 8px;
@@ -649,11 +653,12 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
   color: var(--td-text-color-placeholder);
 }
 
-.row-file-folder {
-  display: inline-flex;
-  align-items: center;
-  align-self: flex-start;
-  gap: 4px;
+/* One path per row, clickable to browse that folder. The chip that used to sit
+   under the name is gone, so this cell has to stay scannable at a fixed width:
+   ellipsis, never wrap, or row heights would vary down the list. */
+.cell-path-btn {
+  display: block;
+  min-width: 0;
   max-width: 100%;
   padding: 0;
   border: 0;
@@ -661,23 +666,16 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
   color: var(--td-text-color-placeholder);
   font-family: var(--app-font-family);
   font-size: var(--app-text-sm);
+  line-height: 1.4;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
   transition: color var(--app-motion-fast) ease;
 
   &:hover {
     color: var(--td-brand-color);
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .t-icon {
-    flex: 0 0 auto;
-    font-size: var(--app-text-md);
   }
 }
 
@@ -786,7 +784,7 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
 .meta-sep { opacity: 0.6; }
 .doc-list-row.selected { background: var(--app-selection-bg); }
 .row-file-name:focus-visible,
-.row-file-folder:focus-visible,
+.cell-path-btn:focus-visible,
 .row-more-btn:focus-visible,
 .row-tag:focus-visible,
 .row-tag-add:focus-visible {
@@ -798,6 +796,12 @@ const handleAction = (action: 'download' | 'edit' | 'reparse' | 'cancel-parse' |
   .doc-list-header, .doc-list-row {
     grid-template-columns: 24px minmax(0, 1fr) 100px 28px;
     column-gap: 8px;
+  }
+  /* The path column is dropped, not re-indexed: a display:none cell never
+     becomes a grid item, so the explicit grid-column numbers below still
+     point at the tracks they were written for. */
+  .cell-path {
+    display: none;
   }
   .doc-list-header .cell-tags { display: none; }
   .doc-list-row .cell-tags { grid-column: 2; grid-row: 2; padding-left: 44px; }

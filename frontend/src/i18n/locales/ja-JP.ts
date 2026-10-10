@@ -811,6 +811,7 @@ export default {
     viewModeList: 'リスト表示',
     viewModeToggle: '表示を切り替え',
     columnName: '名前',
+    columnFolder: 'パス',
     columnTag: 'タグ',
     columnSize: 'サイズ',
     columnSource: '取得元',

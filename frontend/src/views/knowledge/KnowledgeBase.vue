@@ -780,8 +780,8 @@ const isFiltering = computed(() =>
     timeRange: updatedTimeRange.value,
   }),
 );
-// A row's folder is worth showing only when the list can span folders.
-const showDocumentFolderPath = computed(() => hasFolders.value && isFiltering.value);
+// Subtree browsing means one list spans many folders, so the path always earns a column.
+const showDocumentFolderPath = computed(() => hasFolders.value);
 const folderBreadcrumbs = computed(() => buildFolderBreadcrumbs(selectedFolderPath.value));
 
 const filterParams = computed(() => {
@@ -2391,7 +2391,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                     <button v-else type="button" class="doc-folder-path__crumb" :title="crumb.name" @click="handleFolderSelect(crumb.path)">{{ crumb.name }}</button>
                   </template>
                   <span v-if="!docListLoading" class="doc-folder-path__count">{{ $t(isFiltering ? 'knowledgeBase.folderTree.filteredCount' : 'knowledgeBase.documentCount', { count: total }) }}</span>
-                  <t-tooltip v-if="showFolderTree && isFiltering" :content="$t('knowledgeBase.folderTree.searchingSubtree')">
+                  <t-tooltip v-if="showFolderTree" :content="$t('knowledgeBase.folderTree.searchingSubtree')">
                     <t-icon name="info-circle" class="doc-folder-path__sep" />
                   </t-tooltip>
                 </nav>
