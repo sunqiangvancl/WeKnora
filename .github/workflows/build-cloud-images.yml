@@ -7,6 +7,13 @@
 #
 # A push-triggered run has an empty `inputs` context, so every input is
 # repeated inline as `inputs.X || '<default>'`; keep the two in sync.
+#
+# ON THIS BRANCH the defaults deliberately point at the fork and at
+# feature/knowledge-folders, and the `||` fallbacks resolve to the repository and
+# commit that triggered the run instead of a pinned upstream sha. That is what
+# lets a push to this branch build and test exactly what was pushed. main's copy
+# still pins Tencent/WeKnora@1fa915d; do not "resync" this back without wanting
+# to, and revert these three defaults before this branch is ever merged.
 name: Build cloud images (release assets)
 
 on:
@@ -14,18 +21,26 @@ on:
   push:
     paths:
       - ".github/workflows/build-cloud-images.yml"
+      - "internal/**"
+      - "migrations/**"
+      - "frontend/**"
+      - "go.mod"
+      - "go.sum"
     branches:
       - main
+      # The knowledge-folders branch carries this file too, so editing it there
+      # starts a run without anyone clicking anything.
+      - feature/knowledge-folders
   workflow_dispatch:
     inputs:
       source_repo:
         description: "Source repository to build (owner/name)"
         required: true
-        default: "Tencent/WeKnora"
+        default: "sunqiangvancl/WeKnora"
       source_ref:
         description: "Commit sha, branch or tag to build"
         required: true
-        default: "1fa915d712288902da7841dc8ff355a56e37a013"
+        default: "feature/knowledge-folders"
       release_tag:
         description: "Release tag that holds the image tarballs"
         required: true
@@ -62,21 +77,96 @@ jobs:
           else
             gh release create "$tag" --repo "${{ github.repository }}" --latest=false \
               --title "Cloud images" \
-              --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo || 'Tencent/WeKnora' }} by the Build cloud images workflow."
+              --notes "Prebuilt linux/amd64 images for the Tencent Cloud box, installed with docker load. Built from ${{ inputs.source_repo || github.repository }} by the Build cloud images workflow."
           fi
           echo "release: https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
 
+  test:
+    # Gate for both artifacts. Nothing has been compiled from this branch on the
+    # cloud box (its Go is 1.25.8 against a go.mod that requires 1.26.0, and it
+    # has no node/npm at all), so this job is the first real compile of the
+    # patch. Commands mirror .github/workflows/app.yml rather than inventing a
+    # second definition of "does the app build".
+    name: compile + folder tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      pg:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout ${{ inputs.source_repo || github.repository }}@${{ inputs.source_ref || github.sha }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repo || github.repository }}
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Compile everything the app image contains
+        shell: bash
+        run: |
+          mapfile -t pkgs < <(go list ./... | grep -v '/docreader/')
+          go vet "${pkgs[@]}"
+          go build ./cmd/server
+
+      - name: Folder unit tests
+        shell: bash
+        run: |
+          go test -count=1 ./internal/types/ -run 'Folder'
+          go test -count=1 ./internal/application/service/ -run 'Folder'
+          go test -count=1 ./internal/handler/ -run 'Folder'
+
+      - name: Run migration 000900 up and down on real PostgreSQL
+        # The migration is the only irreversible part of this patch, and it has
+        # never been executed anywhere. up -> verify -> down -> up also proves the
+        # IF NOT EXISTS guards make a retry safe.
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: ci
+          PGPASSWORD: ci
+          PGDATABASE: ci
+        run: |
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
+          psql -v ON_ERROR_STOP=1 -c "\d knowledge_folders" | grep -q path
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.down.sql
+          psql -v ON_ERROR_STOP=1 -Atc "SELECT to_regclass('public.knowledge_folders') IS NULL" | grep -qx t
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
+
+      - name: Folder endpoints are registered for API keys
+        # An unregistered route is refused by the API-key gate by default, which
+        # is how GET /skills/catalog ended up JWT-only. This asserts ours are in.
+        shell: bash
+        run: |
+          go test -count=1 ./internal/router/ -run 'ApiKey|Capability'
+
   app:
     name: app image (linux/amd64)
-    needs: prepare
+    needs: [prepare, test]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Checkout ${{ inputs.source_repo || 'Tencent/WeKnora' }}@${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
+      - name: Checkout ${{ inputs.source_repo || github.repository }}@${{ inputs.source_ref || github.sha }}
         uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.source_repo || 'Tencent/WeKnora' }}
-          ref: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
+          repository: ${{ inputs.source_repo || github.repository }}
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Resolve version info
         id: v
@@ -120,8 +210,8 @@ jobs:
           docker save "wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
           sha256sum "$name" > SHA256SUMS-app.txt
           {
-            echo "source_repo: ${{ inputs.source_repo || 'Tencent/WeKnora' }}"
-            echo "source_ref_requested: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}"
+            echo "source_repo: ${{ inputs.source_repo || github.repository }}"
+            echo "source_ref_requested: ${{ inputs.source_ref || github.sha }}"
             echo "resolved_sha: ${{ steps.v.outputs.full }}"
             echo "image_tag: wechatopenai/weknora-app:cloud-${{ steps.v.outputs.short }}"
             echo "with_anydoc: ${{ inputs.with_anydoc || '1' }}"
@@ -147,15 +237,15 @@ jobs:
 
   ui:
     name: ui image (linux/amd64)
-    needs: prepare
+    needs: [prepare, test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout ${{ inputs.source_repo || 'Tencent/WeKnora' }}@${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
+      - name: Checkout ${{ inputs.source_repo || github.repository }}@${{ inputs.source_ref || github.sha }}
         uses: actions/checkout@v6
         with:
-          repository: ${{ inputs.source_repo || 'Tencent/WeKnora' }}
-          ref: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}
+          repository: ${{ inputs.source_repo || github.repository }}
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Resolve version info
         id: v
@@ -191,8 +281,8 @@ jobs:
           docker save "wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
           sha256sum "$name" > SHA256SUMS-ui.txt
           {
-            echo "source_repo: ${{ inputs.source_repo || 'Tencent/WeKnora' }}"
-            echo "source_ref_requested: ${{ inputs.source_ref || '1fa915d712288902da7841dc8ff355a56e37a013' }}"
+            echo "source_repo: ${{ inputs.source_repo || github.repository }}"
+            echo "source_ref_requested: ${{ inputs.source_ref || github.sha }}"
             echo "resolved_sha: ${{ steps.v.outputs.full }}"
             echo "image_tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
             echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
