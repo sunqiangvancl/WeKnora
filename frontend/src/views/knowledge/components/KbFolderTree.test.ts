@@ -66,3 +66,12 @@ test('the folder count badge shows the subtree total', () => {
   // the single-level count, so it has to stay in the template.
   assert.match(tree, /direct: row\.documentCount/)
 })
+
+// The path used to be a chip under the name, shown only while filtering.
+// With subtree browsing a single list spans many folders, so it becomes a column.
+test('the list view has a real folder-path column', () => {
+  assert.match(listView, /class="cell cell-path" role="columnheader"/)
+  assert.match(listView, /class="cell cell-path" role="cell"/)
+  // narrow variant must hide it rather than shift every grid-column index
+  assert.match(listView, /\.cell-path\s*\{\s*display:\s*none/)
+})
