@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 
 import {
   buildFolderRows,
@@ -156,9 +157,9 @@ test('tree rows carry the recursive total, which is how much a folder contains',
   assert.equal(handbook.documentCount, 1)
 })
 
-// Browsing a folder shows its own sub-folders as list entries, which is what
-// lets a document uploaded on its own simply sit at the top level next to the
-// folders instead of needing a mode switch to be found.
+// childFolders() answers "which folders are directly inside this one". No view
+// calls it: the document list lists documents, not folder entries, so this test
+// only pins the helper's contract until it gets a caller or is removed.
 test('the list shows the direct sub-folders of the browsed folder', () => {
   assert.deepEqual(
     childFolders(tree, ROOT_FOLDER_PATH).map((node) => node.path),
@@ -174,14 +175,24 @@ test('the list shows the direct sub-folders of the browsed folder', () => {
   assert.deepEqual(childFolders(null, ROOT_FOLDER_PATH), [])
 })
 
-// The browse/search distinction replaces the scope switch: it is derived from
-// what the user is already doing rather than from a control they must interpret.
-test('any active filter turns browsing into a subtree search', () => {
+// Browsing a folder lists its whole subtree. The old browse/search split is gone:
+// isFilteringDocuments() now only decides the header wording, never the query scope.
+test('browsing a folder always includes descendant folders', () => {
+  const view = readFileSync(new URL('./KnowledgeBase.vue', import.meta.url), 'utf8')
+  assert.match(view, /folder_recursive:\s*true/)
+  assert.doesNotMatch(view, /folder_recursive:\s*isFiltering\.value/)
+})
+
+// isFilteringDocuments() survives, but only as a copy switch. Keep its truth table
+// so the header still distinguishes "everything below me" from "matching my filter".
+test('isFilteringDocuments still reports whether any filter is active', () => {
   assert.equal(isFilteringDocuments({}), false)
+  assert.equal(isFilteringDocuments({ keyword: 'x' }), true)
+
+  // The rest of the truth table is unchanged: which inputs count as a filter.
   assert.equal(isFilteringDocuments({ keyword: '   ' }), false, 'whitespace is not a search')
   assert.equal(isFilteringDocuments({ timeRange: [] }), false)
   assert.equal(isFilteringDocuments({ timeRange: ['', ''] }), false)
-
   assert.equal(isFilteringDocuments({ keyword: 'spec' }), true)
   assert.equal(isFilteringDocuments({ tagIds: ['t1'] }), true)
   assert.equal(isFilteringDocuments({ fileType: 'pdf' }), true)
