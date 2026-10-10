@@ -6795,7 +6795,7 @@ export default {
       filteredCount: '匹配 {count} 个文档',
       title: '目录',
       rootRow: '根目录',
-      rootRowTip: '知识库根目录，未归入子文件夹的文档在此',
+      rootRowTip: '知识库根目录，点开列出全部文档（含子目录）',
       folderCardCount: '{count} 个文档',
       searchingSubtree: '（含子目录）',
       emptyFolder: '这个文件夹里还没有文档',

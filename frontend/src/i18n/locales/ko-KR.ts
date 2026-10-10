@@ -6793,7 +6793,7 @@ export default {
       filteredCount: '일치하는 문서 {count}개',
       title: '폴더',
       rootRow: '루트',
-      rootRowTip: '지식 베이스 루트 디렉터리, 하위 폴더에 없는 문서가 여기에 있습니다',
+      rootRowTip: '지식 베이스 루트 디렉터리, 하위 폴더의 문서까지 모두 보여 줍니다',
       folderCardCount: '문서 {count}개',
       searchingSubtree: '(하위 폴더 포함)',
       emptyFolder: '이 폴더에는 아직 문서가 없습니다',

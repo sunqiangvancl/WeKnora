@@ -605,7 +605,7 @@ export default {
       filteredCount: '{count} matching documents',
       title: 'Folders',
       rootRow: 'Root',
-      rootRowTip: 'Knowledge base root; documents not in a subfolder live here',
+      rootRowTip: 'Knowledge base root; lists every document, including those in subfolders',
       folderCardCount: '{count} documents',
       searchingSubtree: '(including sub-folders)',
       emptyFolder: 'This folder has no documents yet',

@@ -605,7 +605,7 @@ export default {
       filteredCount: '{count} 件一致',
       title: 'フォルダ',
       rootRow: 'ルート',
-      rootRowTip: 'ナレッジベースのルート。サブフォルダに属さないドキュメントはここに置かれます',
+      rootRowTip: 'ナレッジベースのルート。サブフォルダを含めてすべてのドキュメントを表示します',
       folderCardCount: '{count}件のドキュメント',
       searchingSubtree: '（サブフォルダを含む）',
       emptyFolder: 'このフォルダにはまだドキュメントがありません',
