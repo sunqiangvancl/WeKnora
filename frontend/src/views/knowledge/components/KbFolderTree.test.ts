@@ -75,3 +75,51 @@ test('the list view has a real folder-path column', () => {
   // narrow variant must hide it rather than shift every grid-column index
   assert.match(listView, /\.cell-path\s*\{\s*display:\s*none/)
 })
+
+test('the header cells sit in the same order as the row cells', () => {
+  const orderOf = (role: string) => listView
+    .split('\n')
+    .filter((line) => line.includes('role="' + role + '"'))
+    .map((line) => (/class="cell (cell-[a-z]+)"/.exec(line) || ['', ''])[1])
+  const expected = ['cell-check', 'cell-name', 'cell-path', 'cell-tags', 'cell-status', 'cell-actions']
+  // path sits between name and tags in BOTH, so no track can drift one cell sideways
+  assert.deepEqual(orderOf('columnheader'), expected)
+  assert.deepEqual(orderOf('cell'), expected)
+})
+
+// The path column is a grid track, so the template and the cells cannot drift:
+// an ungated six-track template hands a folderless knowledge base five cells in
+// six tracks, an empty trailing track and a status column 88px too wide.
+test('the six-track template is gated on the same condition as the path cells', () => {
+  const six = '24px minmax(0, 1fr) minmax(140px, 18%) minmax(180px, 24%) 100px 28px'
+  const five = '24px minmax(0, 1fr) minmax(180px, 24%) 100px 28px'
+  // three grid definitions: five-track default, gated six-track, narrow override
+  assert.equal((listView.match(/grid-template-columns/g) ?? []).length, 3)
+  assert.equal(listView.split(six).length - 1, 1)
+  assert.equal(listView.split(five).length - 1, 1)
+  assert.match(
+    listView,
+    /\.doc-list-header\.has-path,\s*\.doc-list-row\.has-path\s*\{[^}]*grid-template-columns: 24px minmax\(0, 1fr\) minmax\(140px, 18%\) minmax\(180px, 24%\) 100px 28px;/)
+  assert.match(
+    listView,
+    /\.doc-list-header,\s*\.doc-list-row\s*\{[^}]*grid-template-columns: 24px minmax\(0, 1fr\) minmax\(180px, 24%\) 100px 28px;/)
+  // the class rides the same prop as both v-if cells, on the header and each row
+  assert.match(listView, /class="doc-list-header"[^\n]*'has-path': showFolderPath/)
+  assert.match(listView, /class="doc-list-row"[\s\S]{0,200}?'has-path': showFolderPath/)
+})
+
+test('the narrow override must out-specify the gated wide rule', () => {
+  const narrow = listView.slice(listView.indexOf('@container doc-card-area (max-width: 720px)'))
+  assert.ok(narrow.length > 0)
+  // @container adds no specificity, so a bare (0,1,0) narrow rule loses to
+  // `.doc-list-header.has-path` (0,2,0) and keeps six tracks in a 720px panel:
+  // the narrow template has to restate the gated pair as well as the plain one.
+  assert.match(
+    narrow,
+    /\.doc-list-header,\s*\.doc-list-row,\s*\.doc-list-header\.has-path,\s*\.doc-list-row\.has-path\s*\{[^}]*grid-template-columns: 24px minmax\(0, 1fr\) 100px 28px;/)
+  // the path column is dropped, not re-indexed, so these indices stay verbatim
+  assert.match(narrow, /\.cell-path\s*\{\s*display:\s*none/)
+  assert.match(narrow, /\.doc-list-row \.cell-tags\s*\{\s*grid-column: 2;\s*grid-row: 2;\s*padding-left: 44px;\s*\}/)
+  assert.match(narrow, /\.cell-status\s*\{\s*grid-column: 3;\s*grid-row: 1;\s*\}/)
+  assert.match(narrow, /\.cell-actions\s*\{\s*grid-column: 4;\s*grid-row: 1;\s*\}/)
+})
