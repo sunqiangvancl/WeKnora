@@ -6,6 +6,7 @@ const tree = readFileSync(new URL('./KbFolderTree.vue', import.meta.url), 'utf8'
 const batchBar = readFileSync(new URL('./DocumentBatchBar.vue', import.meta.url), 'utf8')
 const cardView = readFileSync(new URL('./DocumentCardView.vue', import.meta.url), 'utf8')
 const listView = readFileSync(new URL('./DocumentListView.vue', import.meta.url), 'utf8')
+const kb = readFileSync(new URL('../KnowledgeBase.vue', import.meta.url), 'utf8')
 
 // The root folder's own path IS the empty string, so a falsy "nothing is being
 // renamed" sentinel matches it and leaves a stray rename input on the root row.
@@ -122,4 +123,21 @@ test('the narrow override must out-specify the gated wide rule', () => {
   assert.match(narrow, /\.doc-list-row \.cell-tags\s*\{\s*grid-column: 2;\s*grid-row: 2;\s*padding-left: 44px;\s*\}/)
   assert.match(narrow, /\.cell-status\s*\{\s*grid-column: 3;\s*grid-row: 1;\s*\}/)
   assert.match(narrow, /\.cell-actions\s*\{\s*grid-column: 4;\s*grid-row: 1;\s*\}/)
+})
+
+// One prop used to drive both views, so widening it to make the column always
+// available silently widened the card too, where the chip is the v-if arm of a
+// v-if/v-else pair and every filed card lost its updated timestamp. The gates are
+// two separate computeds now, one per view.
+test('the path column and the card chip get separate gates', () => {
+  const attrsOf = (component: string) => {
+    const start = kb.indexOf('<' + component)
+    return kb.slice(start, kb.indexOf('/>', start))
+  }
+  assert.match(kb, /const showDocumentFolderColumn = computed\(\(\) => hasFolders\.value\);/)
+  assert.match(kb, /const showDocumentFolderPath = computed\(\(\) => hasFolders\.value && isFiltering\.value\);/)
+  assert.match(attrsOf('DocumentListView'), /:show-folder-path="showDocumentFolderColumn"/)
+  assert.match(attrsOf('DocumentCardView'), /:show-folder-path="showDocumentFolderPath"/)
+  // the chip competes with the timestamp for one slot, so it stays filter-gated
+  assert.match(cardView, /v-if="showFolderPath && item\.folder_path"[\s\S]{0,400}?<span v-else class="card-time"/)
 })
