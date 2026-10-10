@@ -62,4 +62,7 @@ test('the folder count badge shows the subtree total', () => {
     /class="kb-folder-row__count"[\s\S]{0,300}?\{\{ row\.totalCount \}\}/,
   )
   assert.doesNotMatch(tree, /\{\{ row\.documentCount \}\}/)
+  // The badge is the subtree total; the tooltip is still the only place that names
+  // the single-level count, so it has to stay in the template.
+  assert.match(tree, /direct: row\.documentCount/)
 })
