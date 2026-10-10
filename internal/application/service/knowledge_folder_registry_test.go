@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,6 +14,8 @@ import (
 // It embeds the interface so unrelated methods stay unavailable by construction,
 // exactly like the existing folder move stub.
 type folderRegistryStub struct {
+	interfaces.KnowledgeRepository
+
 	paths       []string // registry contents
 	documents   int64    // CountFolderSubtreeDocuments answer
 	registered  []string // ListRegisteredChildFolders answer

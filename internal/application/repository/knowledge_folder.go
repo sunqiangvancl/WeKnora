@@ -19,14 +19,16 @@ import (
 // below it" query, so a folder and its descendants are always matched the same
 // way. The ESCAPE clause pairs with escapeLikeKeyword, which is required because
 // folder paths routinely contain "_" and "%" (dates, client names).
-const folderSubtreeCondition = "path = ? OR path LIKE ? ESCAPE " + "'\\'"
+const folderSubtreeCondition = "path = ? OR path LIKE ? ESCAPE ?"
 
 // knowledgeSubtreeCondition is the same idea for knowledges.folder_path.
-const knowledgeSubtreeCondition = "folder_path = ? OR folder_path LIKE ? ESCAPE " + "'\\'"
+const knowledgeSubtreeCondition = "folder_path = ? OR folder_path LIKE ? ESCAPE ?"
 
-// subtreeArgs builds the two bind parameters for a "* or below" condition.
+// subtreeArgs builds the bind parameters for a "this path or below" condition.
+// The escape character is knowledge.go's own likeEscapeChar, so the clause and
+// the escaping of the pattern can never drift apart.
 func subtreeArgs(path string) []interface{} {
-	return []interface{}{path, escapeLikeKeyword(path) + "/%"}
+	return []interface{}{path, escapeLikeKeyword(path) + "/%", likeEscapeChar}
 }
 
 // ListRegisteredFolderPaths returns every live registry path in a knowledge base.
@@ -134,8 +136,8 @@ func (r *knowledgeRepository) ListRegisteredChildFolders(
 	var paths []string
 	err := r.db.WithContext(ctx).
 		Model(&types.KnowledgeFolder{}).
-		Where("tenant_id = ? AND knowledge_base_id = ? AND path LIKE ? ESCAPE "+`'\'`+" ?",
-			tenantID, kbID, escapeLikeKeyword(path)+"/%").
+		Where("tenant_id = ? AND knowledge_base_id = ? AND path LIKE ? ESCAPE ?",
+			tenantID, kbID, escapeLikeKeyword(path)+"/%", likeEscapeChar).
 		Order("path ASC").
 		Pluck("path", &paths).Error
 	if err != nil {
@@ -184,10 +186,10 @@ func renameRegisteredFolders(
 	// and win the merge.
 	var staying []string
 	if err := tx.Model(&types.KnowledgeFolder{}).
-		Where("tenant_id = ? AND knowledge_base_id = ? AND path LIKE ? ESCAPE "+`'\'`+" ? AND path NOT LIKE ? ESCAPE "+`'\'`+" ?",
+		Where("tenant_id = ? AND knowledge_base_id = ? AND path LIKE ? ESCAPE ? AND path NOT LIKE ? ESCAPE ?",
 			tenantID, kbID,
-			escapeLikeKeyword(to)+"/%",
-			escapeLikeKeyword(from)+"/%",
+			escapeLikeKeyword(to)+"/%", likeEscapeChar,
+			escapeLikeKeyword(from)+"/%", likeEscapeChar,
 		).
 		Pluck("path", &staying).Error; err != nil {
 		return 0, err
