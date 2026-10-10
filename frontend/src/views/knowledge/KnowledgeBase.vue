@@ -780,8 +780,14 @@ const isFiltering = computed(() =>
     timeRange: updatedTimeRange.value,
   }),
 );
-// Subtree browsing means one list spans many folders, so the path always earns a column.
-const showDocumentFolderPath = computed(() => hasFolders.value);
+// Subtree browsing means one list spans many folders, so the path always earns a
+// column. Only the column is gated this way: it is a real grid track and falls
+// back to the old five tracks as soon as a knowledge base has no folders.
+const showDocumentFolderColumn = computed(() => hasFolders.value);
+// The card view keeps the pre-existing gate, because its folder chip is the
+// v-if arm of a v-if/v-else pair: showing it hides that card's updated
+// timestamp. It is therefore only worth it while a filter spans folders.
+const showDocumentFolderPath = computed(() => hasFolders.value && isFiltering.value);
 const folderBreadcrumbs = computed(() => buildFolderBreadcrumbs(selectedFolderPath.value));
 
 const filterParams = computed(() => {
@@ -2592,7 +2598,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
                     :move-selected-target-name="moveSelectedTargetName"
                     :move-mode="moveMode"
                     :move-submitting="moveSubmitting"
-                    :show-folder-path="showDocumentFolderPath"
+                    :show-folder-path="showDocumentFolderColumn"
                     @open-folder="handleFolderSelect"
                     @move-to-folder="(item: any, path: string) => moveKnowledgeIntoFolder([item.id], path)"
                     @open="(item: any) => openKnowledgeItem(item)" @toggle-row="toggleSelectRow"
