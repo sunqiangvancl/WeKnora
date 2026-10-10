@@ -601,7 +601,7 @@ export default {
       deleteSuccess: 'Folder deleted',
       deleteFailed: 'Failed to delete folder',
       totalDocuments: '{count} documents total',
-      countHint: '{direct} documents in this folder; {total} including subfolders',
+      countHint: '{total} documents including subfolders, {direct} directly in this folder',
       filteredCount: '{count} matching documents',
       title: 'Folders',
       rootRow: 'Root',

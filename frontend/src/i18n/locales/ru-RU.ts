@@ -6789,7 +6789,7 @@ export default {
       deleteSuccess: 'Папка удалена',
       deleteFailed: 'Не удалось удалить папку',
       totalDocuments: 'Всего документов: {count}',
-      countHint: 'В этой папке: {direct}, с подпапками: {total}',
+      countHint: 'всего {total} документов с учётом вложенных папок, {direct} — в этой папке',
       filteredCount: 'Найдено документов: {count}',
       title: 'Папки',
       rootRow: 'Корень',

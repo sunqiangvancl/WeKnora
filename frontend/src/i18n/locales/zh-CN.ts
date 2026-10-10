@@ -6791,7 +6791,7 @@ export default {
       deleteSuccess: '文件夹已删除',
       deleteFailed: '文件夹删除失败',
       totalDocuments: '共 {count} 个文档',
-      countHint: '当前目录 {direct} 个文档，含子目录共 {total} 个',
+      countHint: '含子目录共 {total} 个文档，其中本目录 {direct} 个',
       filteredCount: '匹配 {count} 个文档',
       title: '目录',
       rootRow: '根目录',

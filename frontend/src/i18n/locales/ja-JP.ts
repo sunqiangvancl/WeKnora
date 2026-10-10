@@ -601,7 +601,7 @@ export default {
       deleteSuccess: 'フォルダを削除しました',
       deleteFailed: 'フォルダの削除に失敗しました',
       totalDocuments: '全 {count} 件',
-      countHint: 'このフォルダ内 {direct} 件、サブフォルダを含めて {total} 件',
+      countHint: 'サブフォルダーを含めて合計 {total} 件、このフォルダー直下は {direct} 件',
       filteredCount: '{count} 件一致',
       title: 'フォルダ',
       rootRow: 'ルート',

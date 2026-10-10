@@ -6789,7 +6789,7 @@ export default {
       deleteSuccess: '폴더가 삭제되었습니다',
       deleteFailed: '폴더 삭제에 실패했습니다',
       totalDocuments: '전체 문서 {count}개',
-      countHint: '현재 폴더 문서 {direct}개, 하위 폴더 포함 {total}개',
+      countHint: '하위 폴더를 포함해 총 {total}개, 이 폴더 바로 아래 {direct}개',
       filteredCount: '일치하는 문서 {count}개',
       title: '폴더',
       rootRow: '루트',
