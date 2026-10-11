@@ -849,9 +849,6 @@ func (a *asynqTaskInspector) RetryAllArchivedRuntimeTasks(
 	result := types.RuntimeRetryAllResult{ByType: make(map[string]int)}
 
 	counts := a.archivedTypeCounts(ctx, queue)
-	for _, n := range counts {
-		result.Skipped += n
-	}
 	selected := taskTypes
 	if len(selected) == 0 {
 		selected = make([]string, 0, len(counts))
@@ -859,20 +856,48 @@ func (a *asynqTaskInspector) RetryAllArchivedRuntimeTasks(
 			selected = append(selected, taskType)
 		}
 	}
+	isSelected := make(map[string]bool, len(selected))
+	failedByType := make(map[string]int, len(selected))
+	state := a.archivedTaskState()
 	for _, want := range selected {
 		taskType := want
-		n := a.processQueueStateMatches(
-			ctx, queue, a.archivedTaskState(), true,
+		if isSelected[taskType] {
+			continue // the request listed this type twice; one walk per type
+		}
+		isSelected[taskType] = true
+		failed := 0
+		retried := a.processQueueStateMatches(
+			ctx, queue, state, true,
 			func(gotType string, _ []byte) bool { return gotType == taskType },
 			"retry_all",
-			func(task *asynq.TaskInfo) error { return a.inspector.RunTask(queue, task.ID) },
+			func(task *asynq.TaskInfo) error {
+				if err := a.inspector.RunTask(queue, task.ID); err != nil {
+					failed++ // attempted but not revived; still archived
+					return err
+				}
+				return nil
+			},
 		)
-		if n == 0 {
-			continue
+		failedByType[taskType] = failed
+		// Selected types always get a ByType entry, zero included, so the
+		// operator can tell "selected but all failed" from "not selected".
+		result.ByType[taskType] = retried
+		result.Retried += retried
+		result.Failed += failed
+	}
+	// Snapshot partition: whatever a type's count held that the walk neither
+	// revived nor attempted stays in Skipped — the whole amount for
+	// unselected types, the remainder for selected ones. Tasks that newly
+	// archive mid-walk can only be claimed by selected-type passes, so the
+	// selected remainder is floored at zero and Skipped cannot go negative.
+	for taskType, n := range counts {
+		if isSelected[taskType] {
+			n -= result.ByType[taskType] + failedByType[taskType]
+			if n < 0 {
+				n = 0
+			}
 		}
-		result.ByType[taskType] = n
-		result.Retried += n
-		result.Skipped -= n
+		result.Skipped += n
 	}
 	return result, true, nil
 }

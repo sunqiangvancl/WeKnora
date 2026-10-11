@@ -83,11 +83,23 @@ type RuntimeTaskInfo struct {
 }
 
 // RuntimeRetryAllResult reports what a bulk retry of a queue's archived
-// (finally-failed) tasks did. Skipped counts archived tasks whose type was not
-// selected: they stay in the dead-letter set, untouched and still visible.
+// (finally-failed) tasks did. The three totals partition the archived set as
+// it stood when the call counted it: Retried counts tasks whose RunTask
+// succeeded; Failed counts tasks of a selected type that the call attempted
+// and could not revive (RunTask returned an error, including for a task that
+// vanished between listing and the retry); Skipped counts the snapshot
+// members the call left untouched — their type was not selected, or the walk
+// stopped before reaching them. Retried + Failed + Skipped therefore accounts
+// for every task the count saw; tasks that newly archive mid-call can only
+// raise Retried/Failed above that snapshot, and a selected type's untouched
+// remainder is floored at zero, so Skipped can never go negative. ByType
+// carries exactly one entry per selected task type — zero when no task of
+// that type was revived — so "selected but all failed" reads differently
+// from "not selected".
 type RuntimeRetryAllResult struct {
 	Retried int            `json:"retried"`
 	Skipped int            `json:"skipped"`
+	Failed  int            `json:"failed"`
 	ByType  map[string]int `json:"by_type"`
 }
 
