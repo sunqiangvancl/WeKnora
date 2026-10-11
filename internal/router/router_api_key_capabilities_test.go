@@ -63,7 +63,7 @@ func TestPlatformControlPlaneRoutesDeclarePlatformCapabilities(t *testing.T) {
 		{http.MethodGet, "/api/v1/system/admin/runtime/queues", types.APIKeyCapabilitySystemRuntimeRead},
 		{http.MethodPost, "/api/v1/system/admin/runtime/queues/:queue/tasks/:task_id/actions/:action", types.APIKeyCapabilitySystemRuntimeManage},
 		{http.MethodDelete, "/api/v1/system/admin/runtime/queues/:queue/archived", types.APIKeyCapabilitySystemRuntimeManage},
-		{http.MethodPost, "/api/v1/system/admin/runtime/queues/:queue/archived/actions/retry_all", types.APIKeyCapabilitySystemRuntimeManage},
+		{http.MethodPost, "/api/v1/system/admin/runtime/queues/:queue/archived/actions/retry_all", types.APIKeyCapabilitySystemRuntimeRead}, // TEMPORARY deliberate red — revert in the next commit
 		{http.MethodGet, "/api/v1/system/admin/runtime/queues/:queue/archived/facets", types.APIKeyCapabilitySystemRuntimeRead},
 	}
 	for _, tc := range cases {
