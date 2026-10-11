@@ -146,3 +146,28 @@ func TestListArchivedRuntimeTaskFacetsRejectsUnknownQueue(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "Invalid queue")
 }
+
+// TestListArchivedRuntimeTaskFacetsNilMapSerialisesAsEmptyObject — CI filter:
+// Runtime. FIX 5 pins the handler-side promise that a nil count map is
+// serialised as `{}` and never as JSON `null`, because the retry dialog
+// iterates by_type directly. The real inspector always builds a map, so
+// this is the only thing standing between a future nil-returning inspector
+// and a `for ... of null` in the UI.
+func TestListArchivedRuntimeTaskFacetsNilMapSerialisesAsEmptyObject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	insp := &runtimeTaskTestInspector{} // facets left at its nil zero value
+	h := &SystemHandler{taskInspector: insp}
+	r := newRetryAllRouter(h.RetryAllArchivedRuntimeTasks, h.ListArchivedRuntimeTaskFacets)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/q/summary/archived/facets", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, types.QueueSummary, insp.facetsQueue)
+	// RawMessage keeps the assertion on the wire format itself: `{}` vs `null`
+	// is exactly the thing under test, and it is independent of key order.
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "{}", string(body["by_type"]),
+		"a nil facet map must serialise as {}, never null, for frontend iteration")
+}
+
