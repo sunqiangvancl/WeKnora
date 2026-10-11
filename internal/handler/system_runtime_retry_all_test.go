@@ -75,6 +75,50 @@ func TestRetryAllArchivedRuntimeTasksDelegatesToInspector(t *testing.T) {
 	assert.Equal(t, float64(391), body["by_type"].(map[string]interface{})["summary:generation"])
 }
 
+// TestRetryAllArchivedRuntimeTasksRejectsMalformedBody — CI filter: Runtime.
+// Pins the one 400 the retry-all handler adds beyond the purge mapping: a body
+// that is present but not JSON must be refused, not silently treated as "no
+// filter".
+func TestRetryAllArchivedRuntimeTasksRejectsMalformedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	insp := &runtimeTaskTestInspector{retryAllResult: types.RuntimeRetryAllResult{Retried: 1}}
+	h := &SystemHandler{taskInspector: insp}
+	r := newRetryAllRouter(h.RetryAllArchivedRuntimeTasks, h.ListArchivedRuntimeTaskFacets)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/q/summary/archived/actions/retry_all",
+		strings.NewReader(`{"task_types": [`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "Invalid request body")
+	// Refused before the inspector: nothing may have been revived.
+	assert.Equal(t, "", insp.retryAllQueue)
+}
+
+// TestRetryAllArchivedRuntimeTasksWithoutBodyRetriesWholeQueue — CI filter:
+// Runtime. Pins the "whole queue" default: a body-less POST must succeed and
+// forward an empty (nil) task-type list, which the inspector reads as "every
+// type in this queue". Without this test that contract is unpinned and a later
+// "require a body" change would silently turn retry-all into a no-op.
+func TestRetryAllArchivedRuntimeTasksWithoutBodyRetriesWholeQueue(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	insp := &runtimeTaskTestInspector{retryAllResult: types.RuntimeRetryAllResult{
+		Retried: 446, ByType: map[string]int{"summary:generation": 446},
+	}}
+	h := &SystemHandler{taskInspector: insp}
+	r := newRetryAllRouter(h.RetryAllArchivedRuntimeTasks, h.ListArchivedRuntimeTaskFacets)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/q/summary/archived/actions/retry_all", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, types.QueueSummary, insp.retryAllQueue)
+	assert.Nil(t, insp.retryAllTypes, "no body must forward an empty type list = whole queue")
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(446), body["retried"])
+}
+
 // TestListArchivedRuntimeTaskFacetsDelegatesToInspector — CI filter: Runtime.
 func TestListArchivedRuntimeTaskFacetsDelegatesToInspector(t *testing.T) {
 	gin.SetMode(gin.TestMode)

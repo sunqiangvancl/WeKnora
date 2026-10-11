@@ -2157,6 +2157,13 @@ func (h *SystemHandler) PurgeArchivedRuntimeTasks(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "deleted": deleted})
 }
 
+// maxRetryAllBodyBytes bounds the retry-all request body. The payload is a
+// single short array of task-type identifiers, so a few KiB is generous; the
+// per-payload cap idiom matches handler/knowledge_download.go:60 and
+// handler/session/browserskill.go:46, which both wrap c.Request.Body in
+// http.MaxBytesReader rather than trusting a client-declared Content-Length.
+const maxRetryAllBodyBytes = 8 * 1024
+
 // RetryAllArchivedRuntimeTasks moves a queue's finally-failed tasks back to
 // pending, optionally restricted to selected task types. It is the bulk sibling
 // of the single-task run_now action and inherits its semantics: asynq keeps the
@@ -2178,7 +2185,19 @@ func (h *SystemHandler) RetryAllArchivedRuntimeTasks(c *gin.Context) {
 	var body struct {
 		TaskTypes []string `json:"task_types"`
 	}
-	if raw, err := io.ReadAll(c.Request.Body); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+	// A failed read is NOT the same as an empty body: an empty TaskTypes list
+	// means "retry every type in this queue", so swallowing a read error
+	// (aborted upload, HTTP/2 reset, truncated Content-Length) would let a
+	// client bug silently widen the blast radius of a mutating bulk operation.
+	// Fail closed with 400 instead, and cap the read so an oversized body
+	// cannot turn this into a memory-exhaustion vector.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRetryAllBodyBytes)
+	raw, readErr := io.ReadAll(c.Request.Body)
+	if readErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
 		if err := json.Unmarshal(raw, &body); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 			return
@@ -2252,6 +2271,12 @@ func (h *SystemHandler) ListArchivedRuntimeTaskFacets(c *gin.Context) {
 		logger.Errorf(c.Request.Context(), "archived facets queue=%s: %v", queue, err)
 		c.JSON(http.StatusConflict, gin.H{"error": "Archived tasks could not be counted"})
 		return
+	}
+	// Always emit a non-nil map so the JSON serialises to `{}` rather than
+	// `null`, keeping the frontend iteration simple — the same guarantee
+	// GetRuntimeQueues makes for `queues` and ListSystemSettings for its rows.
+	if byType == nil {
+		byType = map[string]int{}
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "by_type": byType})
 }
