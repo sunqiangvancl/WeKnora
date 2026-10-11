@@ -4244,6 +4244,13 @@ export default {
           purgeArchivedConfirm: 'このキューから失敗レコード{count}件をまとめて削除します。キュー内の失敗タスクのみを削除するもので、実行中や保留中のタスクには影響せず、すでに失敗したドキュメントの業務ステータスも戻りません。削除しますか？',
           purgeArchivedSuccess: '失敗したタスク{count}件を削除しました',
           purgeArchivedError: '失敗したタスクの削除に失敗しました',
+          retryAll: '失敗したタスクをまとめて再試行',
+          retryAllTitle: '失敗したタスクをすべて再試行',
+          retryAllNote: '再試行するタスクタイプを選択してください。再試行回数はリセットされないため、各タスクに与えられるのはあと1回の実行機会だけです。',
+          retryAllConfirm: '選択したタイプを再試行',
+          retryAllEmpty: 'このキューに再試行できる失敗タスクはありません。',
+          retryAllSuccess: '{count}件のタスクを再試行しました',
+          retryAllError: '再試行に失敗しました。後ほど再試行してください。',
           stateFilter: 'タスク状態で絞り込み',
           states: {
             active: '実行中',

@@ -727,6 +727,52 @@ export async function purgeArchivedRuntimeTasks(
   return response as unknown as { success: boolean; deleted: number }
 }
 
+/**
+ * Retry every archived (finally-failed) task of the SELECTED task types in one
+ * queue, in a single call. An empty array means "every type in this queue"
+ * (backend contract). The bulk-retry dialog filters types because some fail
+ * deterministically — see views/system/retryAllArchived.ts.
+ * Backend: POST /api/v1/system/admin/runtime/queues/{queue}/archived/actions/retry_all
+ * (SystemAdmin + platform API key capability; a workspace key gets 403).
+ * `failed` counts attempts, not tasks; `by_type` may arrive as null.
+ */
+export async function retryAllArchivedRuntimeTasks(
+  queue: string,
+  taskTypes: string[],
+): Promise<{
+  success: boolean
+  retried: number
+  failed: number
+  skipped: number
+  by_type: Record<string, number> | null
+}> {
+  const response = await post(
+    `/api/v1/system/admin/runtime/queues/${encodeURIComponent(queue)}/archived/actions/retry_all`,
+    { task_types: taskTypes },
+  )
+  return response as unknown as {
+    success: boolean
+    retried: number
+    failed: number
+    skipped: number
+    by_type: Record<string, number> | null
+  }
+}
+
+/**
+ * Archived-task counts per task type for one queue — the rows of the
+ * bulk-retry confirm dialog. Backend guarantees `{}` (never null) for by_type.
+ * Backend: GET /api/v1/system/admin/runtime/queues/{queue}/archived/facets
+ */
+export async function getArchivedRuntimeTaskFacets(
+  queue: string,
+): Promise<{ success: boolean; by_type: Record<string, number> }> {
+  const response = await get(
+    `/api/v1/system/admin/runtime/queues/${encodeURIComponent(queue)}/archived/facets`,
+  )
+  return response as unknown as { success: boolean; by_type: Record<string, number> }
+}
+
 // --- Sandbox backend configuration (per workspace) ---
 
 export interface SandboxVolumeMountConfig {

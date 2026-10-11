@@ -3423,6 +3423,13 @@ export default {
           purgeArchivedConfirm: '현재 큐의 실패 기록 {count}건을 한 번에 제거합니다. 큐의 실패 작업만 정리하며 실행 중이거나 대기 중인 작업에는 영향이 없고, 이미 실패한 문서의 비즈니스 상태도 되돌리지 않습니다. 지울까요?',
           purgeArchivedSuccess: '실패 작업 {count}건을 지웠습니다',
           purgeArchivedError: '실패 작업을 지우지 못했습니다',
+          retryAll: '실패 작업 모두 재시도',
+          retryAllTitle: '실패한 작업 모두 재시도',
+          retryAllNote: '재시도할 작업 유형을 선택하세요. 재시도 횟수는 초기화되지 않으므로 각 작업에는 한 번의 실행 기회만 더 주어집니다.',
+          retryAllConfirm: '선택한 유형 재시도',
+          retryAllEmpty: '이 대기열에는 재시도할 실패 작업이 없습니다.',
+          retryAllSuccess: '{count}개 작업을 재시도했습니다',
+          retryAllError: '재시도에 실패했습니다. 잠시 후 다시 시도해 주세요.',
           stateFilter: '작업 상태별 필터',
           actionError: {
             cancel: '작업을 취소하지 못했습니다',

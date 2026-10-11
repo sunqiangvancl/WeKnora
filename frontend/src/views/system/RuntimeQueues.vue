@@ -340,6 +340,17 @@
             {{ t('system.globalSettings.runtime.tasks.listTitle', { state: taskStateLabel(taskState) }) }}
           </h4>
           <div class="rq-failed-section-actions">
+            <t-button
+              v-if="taskState === 'archived' && tasks.length > 0"
+              variant="text"
+              size="small"
+              theme="primary"
+              :loading="retryAllLoading"
+              :disabled="Boolean(taskActionID)"
+              @click="openRetryAllDialog"
+            >
+              {{ t('system.globalSettings.runtime.tasks.retryAll') }}
+            </t-button>
             <t-popconfirm
               v-if="taskState === 'archived' && tasks.length > 0"
               theme="danger"
@@ -503,6 +514,32 @@
         </div>
       </section>
     </SettingDrawer>
+
+    <t-dialog
+      v-model:visible="retryAllDialog"
+      :header="t('system.globalSettings.runtime.tasks.retryAllTitle')"
+      :close-on-confirm-btn-click="false"
+      :confirm-btn="{
+        content: t('system.globalSettings.runtime.tasks.retryAllConfirm'),
+        loading: retryAllLoading,
+        disabled: retryAllSelected.length === 0,
+      }"
+      :cancel-btn="t('common.cancel')"
+      @confirm="submitRetryAll"
+    >
+      <p class="retry-all-note">{{ t('system.globalSettings.runtime.tasks.retryAllNote') }}</p>
+      <t-checkbox-group v-model="retryAllSelected">
+        <div v-for="entry in retryAllFacets" :key="entry.type" class="retry-all-row">
+          <t-checkbox :value="entry.type">
+            {{ runtimeTaskTypeLabel(entry.type) }}
+            <span class="retry-all-count">{{ entry.count }}</span>
+          </t-checkbox>
+        </div>
+      </t-checkbox-group>
+      <p v-if="!retryAllFacets.length && !retryAllLoading" class="retry-all-note">
+        {{ t('system.globalSettings.runtime.tasks.retryAllEmpty') }}
+      </p>
+    </t-dialog>
   </div>
 </template>
 
@@ -513,10 +550,18 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
 import { mergeRuntimeTaskPage } from './runtimeTaskPagination'
 import {
+  defaultRetryAllSelection,
+  normalizeRetryAllFacets,
+  normalizeRetryAllResult,
+  type RetryAllFacetEntry,
+} from './retryAllArchived'
+import {
   getRuntimeTasks,
   getRuntimeQueues,
   mutateRuntimeTask,
   purgeArchivedRuntimeTasks,
+  retryAllArchivedRuntimeTasks,
+  getArchivedRuntimeTaskFacets,
   type ModelRuntimeStat,
   type QueueStat,
   type RuntimeTask,
@@ -552,6 +597,10 @@ const tasksSentinelRef = ref<HTMLElement | null>(null)
 const taskActionID = ref('')
 const taskAction = ref<RuntimeTaskAction | ''>('')
 const purging = ref(false)
+const retryAllDialog = ref(false)
+const retryAllLoading = ref(false)
+const retryAllSelected = ref<string[]>([])
+const retryAllFacets = ref<RetryAllFacetEntry[]>([])
 
 const TASK_PAGE_SIZE = 20
 const taskStates: RuntimeTaskState[] = ['active', 'pending', 'scheduled', 'retry', 'archived', 'completed']
@@ -894,6 +943,49 @@ async function purgeArchivedTasks() {
     MessagePlugin.error(err?.message || t('system.globalSettings.runtime.tasks.purgeArchivedError'))
   } finally {
     purging.value = false
+  }
+}
+
+async function openRetryAllDialog() {
+  const queue = taskQueue.value?.name
+  if (!queue || retryAllLoading.value) return
+  retryAllDialog.value = true
+  retryAllFacets.value = []
+  retryAllSelected.value = []
+  retryAllLoading.value = true
+  try {
+    const res = await getArchivedRuntimeTaskFacets(queue)
+    retryAllFacets.value = normalizeRetryAllFacets(res?.by_type)
+    // Product decision (see retryAllArchived.ts): leave the deterministic
+    // table-summary type unchecked by default, preselect the transient ones.
+    retryAllSelected.value = defaultRetryAllSelection(retryAllFacets.value)
+  } catch (err: any) {
+    MessagePlugin.error(err?.message || t('system.globalSettings.runtime.tasks.retryAllError'))
+    retryAllDialog.value = false
+  } finally {
+    retryAllLoading.value = false
+  }
+}
+
+async function submitRetryAll() {
+  const queue = taskQueue.value?.name
+  if (!queue || !retryAllSelected.value.length || retryAllLoading.value) return
+  retryAllLoading.value = true
+  try {
+    const res = await retryAllArchivedRuntimeTasks(queue, retryAllSelected.value)
+    // Only `retried` is shown: `failed` counts attempts, not tasks, so the
+    // three counters deliberately do not add up to a task total.
+    const summary = normalizeRetryAllResult(res)
+    MessagePlugin.success(
+      t('system.globalSettings.runtime.tasks.retryAllSuccess', { count: summary.retried }),
+    )
+    retryAllDialog.value = false
+    await Promise.all([reloadRuntimeTasks(), load(false)])
+    taskQueue.value = queues.value.find((item) => item.name === queue) ?? taskQueue.value
+  } catch (err: any) {
+    MessagePlugin.error(err?.message || t('system.globalSettings.runtime.tasks.retryAllError'))
+  } finally {
+    retryAllLoading.value = false
   }
 }
 
@@ -1971,5 +2063,27 @@ onUnmounted(() => {
   .rq-failed-row-summary {
     gap: 4px;
   }
+}
+
+.retry-all-note {
+  margin: 0 0 12px;
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-sm);
+}
+
+.retry-all-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.retry-all-count {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-secondary);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--app-text-sm);
 }
 </style>

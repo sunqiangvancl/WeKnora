@@ -4244,6 +4244,13 @@ export default {
           purgeArchivedConfirm: 'Remove all {count} failed records from this queue at once. This only clears failed tasks in the queue — it does not affect running or pending tasks, nor does it roll back the business status of documents that already failed. Clear them?',
           purgeArchivedSuccess: 'Cleared {count} failed tasks',
           purgeArchivedError: 'Failed to clear failed tasks',
+          retryAll: 'Retry all failed',
+          retryAllTitle: 'Retry all failed tasks',
+          retryAllNote: 'Pick the task types to retry. Retry counts are not reset, so each task gets exactly one more attempt.',
+          retryAllConfirm: 'Retry selected types',
+          retryAllEmpty: 'No failed tasks to retry in this queue.',
+          retryAllSuccess: 'Retried {count} tasks',
+          retryAllError: 'Could not retry tasks. Try again later.',
           stateFilter: 'Filter by task state',
           states: {
             active: 'Active',

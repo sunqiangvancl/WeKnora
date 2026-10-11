@@ -3425,6 +3425,13 @@ export default {
           purgeArchivedConfirm: '将从当前队列一次性移除全部 {count} 条失败记录，仅清理队列里的失败任务，不影响运行中或排队中的任务，也不会回滚已失败文档的业务状态。确认清除？',
           purgeArchivedSuccess: '已清除 {count} 条失败任务',
           purgeArchivedError: '清除失败任务失败',
+          retryAll: '重试全部失败',
+          retryAllTitle: '重试全部失败任务',
+          retryAllNote: '按任务类型勾选后重试。重试次数不会重置，每个任务只有再一次执行机会。',
+          retryAllConfirm: '重试所选类型',
+          retryAllEmpty: '该队列当前没有可重试的失败任务。',
+          retryAllSuccess: '已重试 {count} 个任务',
+          retryAllError: '重试失败，请稍后再试',
           stateFilter: '按任务状态筛选',
           actionError: {
             cancel: '终止任务失败',
