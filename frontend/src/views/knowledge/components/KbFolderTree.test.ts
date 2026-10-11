@@ -7,6 +7,7 @@ const batchBar = readFileSync(new URL('./DocumentBatchBar.vue', import.meta.url)
 const cardView = readFileSync(new URL('./DocumentCardView.vue', import.meta.url), 'utf8')
 const listView = readFileSync(new URL('./DocumentListView.vue', import.meta.url), 'utf8')
 const kb = readFileSync(new URL('../KnowledgeBase.vue', import.meta.url), 'utf8')
+const runtimeQueues = readFileSync(new URL('../../system/RuntimeQueues.vue', import.meta.url), 'utf8')
 
 // The root folder's own path IS the empty string, so a falsy "nothing is being
 // renamed" sentinel matches it and leaves a stray rename input on the root row.
@@ -140,4 +141,14 @@ test('the path column and the card chip get separate gates', () => {
   assert.match(attrsOf('DocumentCardView'), /:show-folder-path="showDocumentFolderPath"/)
   // the chip competes with the timestamp for one slot, so it stays filter-gated
   assert.match(cardView, /v-if="showFolderPath && item\.folder_path"[\s\S]{0,400}?<span v-else class="card-time"/)
+})
+
+// Helper-level tests cannot see the wiring: if the checkbox-state line in
+// RuntimeQueues.vue (openRetryAllDialog) ever regressed to a plain map over all
+// facets, the deterministic Excel-summary tasks (datatable:summary) would be
+// retried by default again and CI would stay green. Pin the product decision at
+// the wiring site, not just in retryAllArchived.ts.
+test('the retry-all dialog routes its default selection through the helper', () => {
+  assert.match(runtimeQueues, /retryAllSelected\.value = defaultRetryAllSelection\(retryAllFacets\.value\)/)
+  assert.doesNotMatch(runtimeQueues, /retryAllSelected\.value = retryAllFacets\.value\.map/)
 })
