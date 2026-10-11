@@ -980,12 +980,21 @@ async function submitRetryAll() {
       t('system.globalSettings.runtime.tasks.retryAllSuccess', { count: summary.retried }),
     )
     retryAllDialog.value = false
-    await Promise.all([reloadRuntimeTasks(), load(false)])
-    taskQueue.value = queues.value.find((item) => item.name === queue) ?? taskQueue.value
   } catch (err: any) {
     MessagePlugin.error(err?.message || t('system.globalSettings.runtime.tasks.retryAllError'))
+    return
   } finally {
     retryAllLoading.value = false
+  }
+  // The retry itself succeeded, so a failing refresh must NOT be reported with
+  // the "retryAllError" message: retry counts are not reset, and a user who
+  // clicks "retry the failure" again burns the single extra attempt each revived
+  // task got. Refresh in its own catch with the accurate stats-refresh message.
+  try {
+    await Promise.all([reloadRuntimeTasks(), load(false)])
+    taskQueue.value = queues.value.find((item) => item.name === queue) ?? taskQueue.value
+  } catch {
+    MessagePlugin.warning(t('system.globalSettings.runtime.errors.generic'))
   }
 }
 
