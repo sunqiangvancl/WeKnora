@@ -326,6 +326,10 @@ func RegisterSystemAdminRoutes(
 			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeManage), handler.MutateRuntimeTask)
 		g.apiKeyRoute(adminRoutes, http.MethodDelete, "/runtime/queues/:queue/archived",
 			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeManage), handler.PurgeArchivedRuntimeTasks)
+		g.apiKeyRoute(adminRoutes, http.MethodPost, "/runtime/queues/:queue/archived/actions/retry_all",
+			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeManage), handler.RetryAllArchivedRuntimeTasks)
+		g.apiKeyRoute(adminRoutes, http.MethodGet, "/runtime/queues/:queue/archived/facets",
+			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeRead), handler.ListArchivedRuntimeTaskFacets)
 
 		// Bulk action — write the current default-quota setting onto
 		// every existing tenant. Lives under /tenants instead of

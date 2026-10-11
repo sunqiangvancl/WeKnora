@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -2153,6 +2155,105 @@ func (h *SystemHandler) PurgeArchivedRuntimeTasks(c *gin.Context) {
 	h.emitQueueTaskAudit(c.Request.Context(), types.AuditActionSystemQueueArchivedPurged, queue, "",
 		map[string]string{"deleted": strconv.Itoa(deleted)})
 	c.JSON(http.StatusOK, gin.H{"success": true, "deleted": deleted})
+}
+
+// RetryAllArchivedRuntimeTasks moves a queue's finally-failed tasks back to
+// pending, optionally restricted to selected task types. It is the bulk sibling
+// of the single-task run_now action and inherits its semantics: asynq keeps the
+// retry counter, so every revived task gets exactly one more attempt.
+// @Summary      Retry all archived tasks in a queue
+// @Tags         System Admin
+// @Accept       json
+// @Produce      json
+// @Param        queue path string true "Queue name"
+// @Param        body body map[string]interface{} false "Optional {\"task_types\":[…]}"
+// @Success      200 {object} map[string]interface{}
+// @Router       /system/admin/runtime/queues/{queue}/archived/actions/retry_all [post]
+func (h *SystemHandler) RetryAllArchivedRuntimeTasks(c *gin.Context) {
+	queue := c.Param("queue")
+	if !isKnownRuntimeQueue(queue) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid queue"})
+		return
+	}
+	var body struct {
+		TaskTypes []string `json:"task_types"`
+	}
+	if raw, err := io.ReadAll(c.Request.Body); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			return
+		}
+	}
+	// A stale client must not be able to reach across queues: every requested
+	// type has to belong to the queue named in the path.
+	for _, taskType := range body.TaskTypes {
+		mappedQueue, known := types.QueueForTaskType(taskType)
+		if !known || mappedQueue != queue {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "task_types contains a type that is not part of this queue",
+			})
+			return
+		}
+	}
+	inspector, supported := h.taskInspector.(interfaces.RuntimeTaskInspector)
+	if !supported {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Task queue is unavailable"})
+		return
+	}
+	result, available, err := inspector.RetryAllArchivedRuntimeTasks(
+		c.Request.Context(), queue, body.TaskTypes)
+	if !available {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Task queue is unavailable"})
+		return
+	}
+	if err != nil {
+		logger.Errorf(c.Request.Context(), "retry all archived queue tasks queue=%s: %v", queue, err)
+		c.JSON(http.StatusConflict, gin.H{"error": "Archived tasks could not be retried"})
+		return
+	}
+	h.emitQueueTaskAudit(c.Request.Context(), types.AuditActionSystemQueueTaskRetried, queue, "",
+		map[string]string{
+			"retried":    strconv.Itoa(result.Retried),
+			"failed":     strconv.Itoa(result.Failed),
+			"skipped":    strconv.Itoa(result.Skipped),
+			"task_types": strings.Join(body.TaskTypes, ","),
+		})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true, "retried": result.Retried,
+		"failed": result.Failed, "skipped": result.Skipped, "by_type": result.ByType,
+	})
+}
+
+// ListArchivedRuntimeTaskFacets counts a queue's archived tasks by type so the
+// confirm dialog can show what a bulk retry would touch before it happens.
+// @Summary      Count archived tasks by type for a queue
+// @Tags         System Admin
+// @Produce      json
+// @Param        queue path string true "Queue name"
+// @Success      200 {object} map[string]interface{}
+// @Router       /system/admin/runtime/queues/{queue}/archived/facets [get]
+func (h *SystemHandler) ListArchivedRuntimeTaskFacets(c *gin.Context) {
+	queue := c.Param("queue")
+	if !isKnownRuntimeQueue(queue) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid queue"})
+		return
+	}
+	inspector, supported := h.taskInspector.(interfaces.RuntimeTaskInspector)
+	if !supported {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Task queue is unavailable"})
+		return
+	}
+	byType, available, err := inspector.ListArchivedRuntimeTaskFacets(c.Request.Context(), queue)
+	if !available {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Task queue is unavailable"})
+		return
+	}
+	if err != nil {
+		logger.Errorf(c.Request.Context(), "archived facets queue=%s: %v", queue, err)
+		c.JSON(http.StatusConflict, gin.H{"error": "Archived tasks could not be counted"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "by_type": byType})
 }
 
 func (h *SystemHandler) ListSystemSettings(c *gin.Context) {
