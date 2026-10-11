@@ -75,6 +75,19 @@ func TestPlatformControlPlaneRoutesDeclarePlatformCapabilities(t *testing.T) {
 			t.Fatalf("%s %s capabilities = %#v, want %s", tc.method, tc.path, policy.Capabilities, tc.capability)
 		}
 	}
+	// The archived-facets GET is the read half of the retry dialog. It has to
+	// accept a manage-only platform key as well, exactly like the two runtime
+	// GETs above: the gate has no manage-implies-read implication, so declaring
+	// read alone would leave a manage-only key able to list queues, purge
+	// archives and fire retry_all, but 403 on the counts the dialog needs to
+	// build that request.
+	facetsPolicy := mustLookupAPIKeyPolicy(t, g, http.MethodGet,
+		"/api/v1/system/admin/runtime/queues/:queue/archived/facets")
+	if !policyHasCapability(facetsPolicy, types.APIKeyCapabilitySystemRuntimeManage) {
+		t.Fatalf("facets capabilities = %#v, want system_runtime_manage as well as read",
+			facetsPolicy.Capabilities)
+	}
+
 	if _, ok := g.apiKeyAuthorizer.Lookup(http.MethodPost, "/api/v1/system/admin/api-keys"); ok {
 		t.Fatal("platform API keys must not create other platform API keys")
 	}

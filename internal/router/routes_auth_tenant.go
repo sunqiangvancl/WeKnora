@@ -328,8 +328,14 @@ func RegisterSystemAdminRoutes(
 			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeManage), handler.PurgeArchivedRuntimeTasks)
 		g.apiKeyRoute(adminRoutes, http.MethodPost, "/runtime/queues/:queue/archived/actions/retry_all",
 			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeManage), handler.RetryAllArchivedRuntimeTasks)
+		// Facets is the read half of the retry dialog, so it takes read OR
+		// manage exactly like its two sibling GETs: the gate has no
+		// manage-implies-read implication, and a manage-only key that can list
+		// queues and purge archives must not 403 on the counts the dialog
+		// needs before it can offer retry-all.
 		g.apiKeyRoute(adminRoutes, http.MethodGet, "/runtime/queues/:queue/archived/facets",
-			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeRead), handler.ListArchivedRuntimeTaskFacets)
+			apiKeyPlatform(types.APIKeyCapabilitySystemRuntimeRead, types.APIKeyCapabilitySystemRuntimeManage),
+			handler.ListArchivedRuntimeTaskFacets)
 
 		// Bulk action — write the current default-quota setting onto
 		// every existing tenant. Lives under /tenants instead of

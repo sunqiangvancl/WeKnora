@@ -215,9 +215,14 @@ jobs:
       - name: Folder endpoints are registered for API keys
         # An unregistered route is refused by the API-key gate by default, which
         # is how GET /skills/catalog ended up JWT-only. This asserts ours are in.
+        # The pattern is an unanchored but CASE-SENSITIVE regexp, so "Capability"
+        # never matched the tests named "…DeclarePlatformCapabilities" (plural) —
+        # the capability table was silently unenforced. "Capabilit" covers every
+        # existing and future singular/plural spelling, so the next test cannot be
+        # named just outside the filter either.
         shell: bash
         run: |
-          go test -count=1 ./internal/router/ -run 'ApiKey|Capability'
+          go test -count=1 ./internal/router/ -run 'ApiKey|Capabilit'
 
   app:
     name: app image (linux/amd64)
