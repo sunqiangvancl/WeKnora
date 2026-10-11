@@ -129,4 +129,19 @@ type RuntimeTaskInspector interface {
 	// document status flipped to "failed" on their last retry, mirroring the
 	// semantics of deleting archived records one by one.
 	PurgeArchivedRuntimeTasks(ctx context.Context, queue string) (deleted int, supported bool, err error)
+	// RetryAllArchivedRuntimeTasks moves archived tasks in one queue back to
+	// pending, restricted to the given task types. An empty taskTypes retries
+	// every type present. Asynq preserves each task's retry counter, so a
+	// revived task gets exactly one more attempt — no budget multiplication.
+	// Like PurgeArchivedRuntimeTasks it only ever touches the archived
+	// (dead-letter) set, so live pending/active/scheduled/retry work is never
+	// at risk.
+	RetryAllArchivedRuntimeTasks(
+		ctx context.Context, queue string, taskTypes []string,
+	) (result types.RuntimeRetryAllResult, supported bool, err error)
+	// ListArchivedRuntimeTaskFacets counts a queue's archived tasks by task
+	// type, so an operator can choose types before retrying instead of after.
+	ListArchivedRuntimeTaskFacets(
+		ctx context.Context, queue string,
+	) (counts map[string]int, supported bool, err error)
 }

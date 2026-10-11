@@ -107,6 +107,11 @@ type runtimeTaskTestInspector struct {
 	getRuntimeErr       error
 	getRuntimeErrFrom   int
 	getRuntimeTaskCalls int
+	retryAllResult      types.RuntimeRetryAllResult
+	retryAllQueue       string
+	retryAllTypes       []string
+	facets              map[string]int
+	facetsQueue         string
 }
 
 func (r *runtimeTaskTestInspector) CancelTasksForKnowledge(
@@ -213,6 +218,20 @@ func (r *runtimeTaskTestInspector) PurgeArchivedRuntimeTasks(
 		return 0, true, r.purgeErr
 	}
 	return r.purgedCount, true, nil
+}
+
+func (r *runtimeTaskTestInspector) RetryAllArchivedRuntimeTasks(
+	_ context.Context, queue string, taskTypes []string,
+) (types.RuntimeRetryAllResult, bool, error) {
+	r.retryAllQueue, r.retryAllTypes = queue, taskTypes
+	return r.retryAllResult, true, nil
+}
+
+func (r *runtimeTaskTestInspector) ListArchivedRuntimeTaskFacets(
+	_ context.Context, queue string,
+) (map[string]int, bool, error) {
+	r.facetsQueue = queue
+	return r.facets, true, nil
 }
 
 func TestGetRuntimeQueuesReportsIsolatedPoolCapacity(t *testing.T) {

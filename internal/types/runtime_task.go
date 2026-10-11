@@ -82,6 +82,15 @@ type RuntimeTaskInfo struct {
 	KnowledgeCount  int                 `json:"knowledge_count,omitempty"`
 }
 
+// RuntimeRetryAllResult reports what a bulk retry of a queue's archived
+// (finally-failed) tasks did. Skipped counts archived tasks whose type was not
+// selected: they stay in the dead-letter set, untouched and still visible.
+type RuntimeRetryAllResult struct {
+	Retried int            `json:"retried"`
+	Skipped int            `json:"skipped"`
+	ByType  map[string]int `json:"by_type"`
+}
+
 // RuntimeTaskPage is one stable slice of the operator task list. NextCursor
 // is opaque to HTTP clients and remains tied to the selected queue/state.
 type RuntimeTaskPage struct {

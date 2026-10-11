@@ -776,6 +776,198 @@ func (a *asynqTaskInspector) PurgeArchivedRuntimeTasks(ctx context.Context, queu
 	return deleted, true, nil
 }
 
+// RetryAllArchivedRuntimeTasks and ListArchivedRuntimeTaskFacets page the
+// archived (dead-letter) set through the raw queue-key reader below.
+//
+// Archived is deliberately NOT registered in cancellableTaskStates(): that
+// list is walked by cancelMatchingTasks, which calls DeleteTask on every
+// non-active state it visits. Registering archived there would silently
+// destroy the operator-visible dead-letter history on every knowledge-base
+// cancel. The shared engine reaches a state only through its
+// cancellableTaskState.list hook, whose paging arrives as opaque
+// asynq.ListOption values the raw reader cannot decode, so the archived walk
+// here mirrors processQueueStateMatches' loop locally instead of calling it.
+// The shared function itself is untouched: every existing cancel/delete
+// caller stays exactly as it was.
+
+// listArchivedRuntimeTasks returns one page (1-based) of a queue's archived
+// zset, newest failure first. The second result is the raw member count
+// before stale-ID and state filtering, so callers can tell a short final
+// page from a fully filtered one.
+func (a *asynqTaskInspector) listArchivedRuntimeTasks(
+	ctx context.Context, queue string, page int,
+) ([]*asynq.TaskInfo, int, error) {
+	key, order := runtimeTaskStateKey(queue, types.RuntimeTaskArchived)
+	if order != runtimeTaskZSetNewestFirst {
+		return nil, 0, fmt.Errorf("unexpected archived storage order %d for queue %s", order, queue)
+	}
+	start := int64(page-1) * listPageSize
+	ids, err := a.redis.ZRevRange(ctx, key, start, start+listPageSize-1).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+	tasks := make([]*asynq.TaskInfo, 0, len(ids))
+	for _, id := range ids {
+		task, getErr := a.inspector.GetTaskInfo(queue, id)
+		if errors.Is(getErr, asynq.ErrTaskNotFound) || errors.Is(getErr, asynq.ErrQueueNotFound) {
+			continue
+		}
+		if getErr != nil {
+			return nil, len(ids), getErr
+		}
+		// A task can leave archived between the zset read and the inspect;
+		// only still-archived records belong to this walk (same state filter
+		// ListRuntimeTasks applies to every raw queue-key page).
+		if task.State != asynq.TaskStateArchived {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, len(ids), nil
+}
+
+// archivedTypeCounts pages the archived set once and counts by task type.
+// Read-only, so plain forward paging is safe: nothing mutates while we walk
+// it.
+func (a *asynqTaskInspector) archivedTypeCounts(ctx context.Context, queue string) map[string]int {
+	counts := make(map[string]int)
+	for page := 1; page <= maxQueueMutationPasses; page++ {
+		if ctx.Err() != nil {
+			return counts
+		}
+		tasks, rawCount, err := a.listArchivedRuntimeTasks(ctx, queue, page)
+		if err != nil {
+			if !errors.Is(err, asynq.ErrQueueNotFound) {
+				logger.Warnf(ctx, "[TaskInspector] list archived queue=%s page=%d: %v", queue, page, err)
+			}
+			return counts
+		}
+		for _, task := range tasks {
+			counts[task.Type]++
+		}
+		if rawCount < listPageSize {
+			return counts
+		}
+	}
+	return counts
+}
+
+// processArchivedMatches mirrors processQueueStateMatches' page loop for
+// the archived set: same listPageSize/maxQueueMutationPasses bounds, same
+// rescan-after-success rule (RunTask removes the task from the archived
+// zset, so later entries shift toward the current page and stepping ahead
+// after a successful mutation would drop an entire page), and the same
+// best-effort error logging. matcher keeps taskMatcher's shape so the
+// per-type call reads like the cancel-path calls into the shared engine.
+func (a *asynqTaskInspector) processArchivedMatches(
+	ctx context.Context,
+	queue string,
+	matcher taskMatcher,
+	actionName string,
+	action func(*asynq.TaskInfo) error,
+) int {
+	processed := 0
+	page := 1
+	passes := 0
+	for passes < maxQueueMutationPasses {
+		passes++
+		if ctx.Err() != nil {
+			return processed
+		}
+		tasks, rawCount, err := a.listArchivedRuntimeTasks(ctx, queue, page)
+		if err != nil {
+			if !errors.Is(err, asynq.ErrQueueNotFound) {
+				logger.Warnf(ctx, "[TaskInspector] list archived queue=%s page=%d: %v", queue, page, err)
+			}
+			return processed
+		}
+		if rawCount == 0 {
+			return processed
+		}
+		processedOnPage := 0
+		for _, task := range tasks {
+			if !matcher(task.Type, task.Payload) {
+				continue
+			}
+			if err := action(task); err != nil {
+				logger.Warnf(ctx, "[TaskInspector] %s archived type=%s id=%s: %v", actionName, task.Type, task.ID, err)
+				continue
+			}
+			processed++
+			processedOnPage++
+		}
+		if processedOnPage > 0 {
+			continue
+		}
+		if rawCount < listPageSize {
+			return processed
+		}
+		page++
+	}
+	logger.Warnf(ctx,
+		"[TaskInspector] stopped %s queue=%s after %d mutation passes (archived)",
+		actionName, queue, maxQueueMutationPasses,
+	)
+	return processed
+}
+
+// ListArchivedRuntimeTaskFacets counts a queue's archived tasks by task
+// type. The availability preamble mirrors PurgeArchivedRuntimeTasks so a
+// degraded or Lite-mode inspector fail-closes with available=false.
+func (a *asynqTaskInspector) ListArchivedRuntimeTaskFacets(
+	ctx context.Context, queue string,
+) (map[string]int, bool, error) {
+	if a == nil || a.inspector == nil || a.redis == nil {
+		return nil, false, nil
+	}
+	return a.archivedTypeCounts(ctx, queue), true, nil
+}
+
+// RetryAllArchivedRuntimeTasks moves a queue's archived (finally-failed)
+// tasks back to pending, restricted to the given task types; an empty
+// taskTypes retries every type present. One archived walk per selected type
+// re-scans the set once per type instead of once overall, which is the
+// point: it yields the per-type counts for free without changing
+// processQueueStateMatches' signature. Asynq preserves each task's retry
+// counter, so a revived task gets exactly one more attempt — no budget
+// multiplication.
+func (a *asynqTaskInspector) RetryAllArchivedRuntimeTasks(
+	ctx context.Context, queue string, taskTypes []string,
+) (types.RuntimeRetryAllResult, bool, error) {
+	if a == nil || a.inspector == nil || a.redis == nil {
+		return types.RuntimeRetryAllResult{ByType: make(map[string]int)}, false, nil
+	}
+	result := types.RuntimeRetryAllResult{ByType: make(map[string]int)}
+
+	counts := a.archivedTypeCounts(ctx, queue)
+	for _, n := range counts {
+		result.Skipped += n
+	}
+	selected := taskTypes
+	if len(selected) == 0 {
+		selected = make([]string, 0, len(counts))
+		for taskType := range counts {
+			selected = append(selected, taskType)
+		}
+	}
+	for _, want := range selected {
+		taskType := want
+		n := a.processArchivedMatches(
+			ctx, queue,
+			func(gotType string, _ []byte) bool { return gotType == taskType },
+			"retry_all",
+			func(task *asynq.TaskInfo) error { return a.inspector.RunTask(queue, task.ID) },
+		)
+		if n == 0 {
+			continue
+		}
+		result.ByType[taskType] = n
+		result.Retried += n
+		result.Skipped -= n
+	}
+	return result, true, nil
+}
+
 func (a *asynqTaskInspector) WorkerServerStats(
 	ctx context.Context,
 ) ([]types.WorkerServerStat, bool, error) {
