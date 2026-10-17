@@ -194,7 +194,7 @@ jobs:
           go test -count=1 ./internal/application/service/ -run 'Folder'
           go test -count=1 ./internal/handler/ -run 'Folder|Runtime'
 
-      - name: Run migration 000900 up and down on real PostgreSQL
+      - name: Run migration 000119 up and down on real PostgreSQL
         # The migration is the only irreversible part of this patch, and it has
         # never been executed anywhere. up -> verify -> down -> up also proves the
         # IF NOT EXISTS guards make a retry safe.
@@ -205,12 +205,12 @@ jobs:
           PGPASSWORD: ci
           PGDATABASE: ci
         run: |
-          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000119_knowledge_folders.up.sql
           psql -v ON_ERROR_STOP=1 -c "\d knowledge_folders" | grep -q path
-          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.down.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000119_knowledge_folders.down.sql
           psql -v ON_ERROR_STOP=1 -Atc "SELECT to_regclass('public.knowledge_folders') IS NULL" | grep -qx t
-          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
-          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000900_knowledge_folders.up.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000119_knowledge_folders.up.sql
+          psql -v ON_ERROR_STOP=1 -f migrations/versioned/000119_knowledge_folders.up.sql
 
       - name: Folder endpoints are registered for API keys
         # An unregistered route is refused by the API-key gate by default, which
@@ -371,4 +371,72 @@ jobs:
             echo "- tag: wechatopenai/weknora-ui:cloud-${{ steps.v.outputs.short }}"
             echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
             echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-ui-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docreader:
+    name: docreader image (linux/amd64)
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout ${{ inputs.source_repo || github.repository }}@${{ inputs.source_ref || github.sha }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repo || github.repository }}
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Resolve version info
+        id: v
+        run: |
+          set -euo pipefail
+          full="$(git rev-parse HEAD)"
+          short="${full:0:7}"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "resolved: $full (short $short)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build docreader image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.docreader
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: wechatopenai/weknora-docreader:cloud-${{ steps.v.outputs.short }}
+          cache-from: type=gha,scope=cloud-docreader
+          cache-to: type=gha,scope=cloud-docreader,mode=max
+
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          name="weknora-docreader-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+          docker save "wechatopenai/weknora-docreader:cloud-${{ steps.v.outputs.short }}" | gzip -1 > "$name"
+          sha256sum "$name" > SHA256SUMS-docreader.txt
+          {
+            echo "source_repo: ${{ inputs.source_repo || github.repository }}"
+            echo "source_ref_requested: ${{ inputs.source_ref || github.sha }}"
+            echo "resolved_sha: ${{ steps.v.outputs.full }}"
+            echo "image_tag: wechatopenai/weknora-docreader:cloud-${{ steps.v.outputs.short }}"
+            echo "built_at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > MANIFEST-docreader.txt
+          ls -lh "$name"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag || 'cloud-images' }}"
+          gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
+            "weknora-docreader-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz" SHA256SUMS-docreader.txt MANIFEST-docreader.txt
+          {
+            echo "### docreader image"
+            echo "- tag: wechatopenai/weknora-docreader:cloud-${{ steps.v.outputs.short }}"
+            echo "- direct: https://github.com/${{ github.repository }}/releases/download/$tag/weknora-docreader-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
+            echo "- via proxy: https://ghfast.top/https://github.com/${{ github.repository }}/releases/download/$tag/weknora-docreader-cloud-${{ steps.v.outputs.short }}-amd64.tar.gz"
           } >> "$GITHUB_STEP_SUMMARY"

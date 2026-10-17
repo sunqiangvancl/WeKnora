@@ -1,4 +1,4 @@
--- Migration 000900: knowledge_folders, the registry of folders that exist
+-- Migration 000119: knowledge_folders, the registry of folders that exist
 -- without holding a document
 --
 -- The knowledge-base sidebar tree is a projection: ListKnowledgeFolderCounts
@@ -10,11 +10,12 @@
 -- (folder upload, move, data-source sync) keeps working untouched and can never
 -- "lose" a folder by forgetting to register it.
 --
--- Numbering: 000900, far above upstream's sequence (110 at v0.8.2, 114 on main)
--- on purpose. A local patch that takes the next sequential number collides with
--- whatever upstream ships there, and the collision only surfaces when someone
--- merges an upstream tag into the branch. Keeping local migrations in a high
--- band makes the merge a no-op for the migration runner.
+-- Numbering: 000119, immediately after upstream v0.8.3's last migration (118).
+-- This file was originally 000900, in a high band meant to avoid collisions
+-- when merging upstream. That band backfired: golang-migrate only applies
+-- versions above the recorded one, so a database already at 900 silently
+-- skipped every upstream migration below it. Keep local migrations sequential
+-- with upstream and renumber them whenever a new upstream tag lands.
 --
 -- PostgreSQL only. migrations/sqlite/ is a separate lineage and is not touched:
 -- this deployment runs PostgreSQL, and mirroring the table into a lineage we

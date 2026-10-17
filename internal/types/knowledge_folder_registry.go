@@ -29,7 +29,7 @@ type KnowledgeFolder struct {
 	DeletedAt       gorm.DeletedAt `json:"deleted_at" gorm:"index"`
 }
 
-// TableName pins the table name to migration 000900.
+// TableName pins the table name to migration 000119.
 func (KnowledgeFolder) TableName() string { return "knowledge_folders" }
 
 // NewKnowledgeFolder builds a registry row for an already-normalized path.
