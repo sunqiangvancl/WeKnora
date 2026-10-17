@@ -31,6 +31,9 @@ on:
       # The knowledge-folders branch carries this file too, so editing it there
       # starts a run without anyone clicking anything.
       - feature/knowledge-folders
+      # Temporary v0.8.3 merge rehearsal branch: lets the push trigger run the
+      # tests and build the three images before feature/knowledge-folders moves.
+      - upgrade/v083-merge
   workflow_dispatch:
     inputs:
       source_repo:
