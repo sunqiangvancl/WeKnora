@@ -1,5 +1,6 @@
 import Image from "next/image";
 import { Icon } from "./ui";
+import { homeAssets } from "../../shared/header";
 
 type Integration = { name: string; logo: string } | { name: string; icon: string };
 
@@ -13,6 +14,7 @@ export const dataSources: Integration[] = [
   { name: "Notion", logo: "notion.ico" },
   { name: "语雀", logo: "yuque.ico" },
   { name: "RSS", logo: "rss.svg" },
+  { name: "Seafile", logo: "seafile.png" },
 ];
 
 export const clients: Integration[] = [
@@ -47,7 +49,7 @@ export const modelProviders: Integration[] = [
 export function IntegrationMark({ item }: { item: Integration }) {
   return <>
     {"logo" in item
-      ? <Image src={`/brands/${item.logo}`} alt="" aria-hidden="true" width={22} height={22} />
+      ? <Image src={`${homeAssets}/brands/${item.logo}`} alt="" aria-hidden="true" width={22} height={22} />
       : <Icon name={item.icon} />}
     {item.name}
   </>;

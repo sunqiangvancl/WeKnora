@@ -279,3 +279,44 @@ curl $BASE/api/v1/system/admin/audit-log -H "Authorization: Bearer $TOKEN"
 ## 实现参考
 
 路由注册：`internal/router/routes_auth_tenant.go` 的 `RegisterSystemAdminRoutes` 与 `RegisterSystemRoutes`。Handler：`internal/handler/system.go`、`internal/handler/audit_log.go`。
+
+
+## 平台用户管理
+
+以下接口仅系统管理员的用户会话可访问，API Key 不开放。
+
+### GET /api/v1/system/admin/users
+
+分页列出整个部署的用户。查询参数 `offset` 默认 0；`limit` 默认 50，最大 200。响应为未包装对象 `{"users":[UserInfo],"offset":0,"limit":50,"has_more":false}`，不返回密码或哈希。
+
+### POST /api/v1/system/admin/users/status
+
+请求体 `{"user_id":"目标用户 ID","is_active":false}`，两个字段都必填。停用会吊销目标用户的已有会话；不能停用自己或最后一位启用的系统管理员（400），用户不存在返回 404。成功返回 `{"message":"User status updated","user":UserInfo,"is_active":false}`。创建账号与重置密码仍使用上文的 `/users/create`、`/users/reset-password`。
+
+## 模型目录（/api/v1/system/admin/model-catalog）
+
+仅系统管理员用户会话可访问，API Key 不开放此组接口。
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `GET /system/admin/model-catalog` | 返回当前 `version`、`baseline`、管理员 `overlay`、最近 20 个历史版本，以及 `builtin` / `deployment` / `effective` 目录 |
+| `POST /system/admin/model-catalog/preview` | 校验覆盖文档并返回候选目录（仅 `effective` 与规范化后的 `overlay`，`history` / `builtin` / `deployment` 为 `null`），不持久化、不发布 |
+| `PUT /system/admin/model-catalog` | 校验、保存新版本并发布；审计仅记录版本元信息 |
+
+预览和发布使用相同请求体：
+
+```json
+{
+  "version": 0,
+  "baseline": "GET 返回的部署基线标识",
+  "overlay": {
+    "providers": {
+      "openai": {
+        "models": [{"id": "gpt-5", "context_window": 128000}]
+      }
+    }
+  }
+}
+```
+
+响应为未包装的目录状态对象。每个厂商条目额外带 `model_thinking_levels`（按对话模型 id 列出开启思考后可选的等级，已合并厂商映射与协议能力）和 `vendor_thinking_levels`（未单独配置等级的模型所用的厂商默认等级）。非法文档返回 400；版本过期或请求实例的部署基线不一致返回 409。发布先持久化再切换本实例，其他实例约 5 秒内同步。回滚使用历史 `overlay` 配合当前 `version` / `baseline` 再次发布。完整规则和限制见[模型管理](../03-features/06-models.md#系统管理员维护模型目录)。
