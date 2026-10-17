@@ -1769,7 +1769,7 @@ onUnmounted(() => {
     margin: 0 0 0 auto;
     height: 22px;
     padding: 0 8px 0 6px;
-    border-radius: 999px;
+    border-radius: var(--app-radius-pill);
     color: var(--td-brand-color);
     background: color-mix(in srgb, var(--td-brand-color) 10%, transparent);
     font-size: var(--app-text-xs);
@@ -1962,7 +1962,7 @@ onUnmounted(() => {
   gap: 3px;
   max-width: 120px;
   padding: 0 6px;
-  border-radius: 999px;
+  border-radius: var(--app-radius-pill);
   background: var(--td-bg-color-secondarycontainer);
   color: var(--td-text-color-secondary);
   font-size: var(--app-text-xs);

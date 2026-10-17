@@ -42,7 +42,7 @@ const RULES = [
     name: 'radius-literal',
     why: '圆角请用 var(--app-radius-xs|sm|md|lg|xl|pill)（4/6/8/10/12/999px）',
     pattern: /border(?:-[a-z]+)*-radius\s*:\s*\d+(?:\.\d+)?px/g,
-    baseline: 160,
+    baseline: 158,
   },
   {
     name: 'font-size-literal',
