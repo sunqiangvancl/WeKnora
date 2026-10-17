@@ -29,8 +29,9 @@ type KnowledgeFolder struct {
 	DeletedAt       gorm.DeletedAt `json:"deleted_at" gorm:"index"`
 }
 
-// TableName pins the table name to migration 000119. Upstream v0.8.3 ends at
-// 000118; local migrations stay sequential so golang-migrate does not skip them.
+// TableName pins the table name to migration 000119. Upstream v0.8.3 ships
+// migrations 111-118; local migrations stay sequential so golang-migrate does
+// not skip upstream versions recorded below a high local number.
 func (KnowledgeFolder) TableName() string { return "knowledge_folders" }
 
 // NewKnowledgeFolder builds a registry row for an already-normalized path.
