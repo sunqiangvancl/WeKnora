@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -139,6 +140,27 @@ func TestEnrichRuntimeTaskNamesResolvesEveryIDField(t *testing.T) {
 	for _, call := range modelNamer.calls {
 		if call.tenantID != 10000 {
 			t.Fatalf("model lookup ran under workspace %d", call.tenantID)
+		}
+	}
+}
+
+// TestEnrichRuntimeTaskNamesCoversAFullPage guards the lookup cap: a page at
+// the API ceiling (100 tasks) must name every document. A cap below the page
+// size silently leaves trailing rows with IDs only — which is exactly what
+// the first deployment of this feature did.
+func TestEnrichRuntimeTaskNamesCoversAFullPage(t *testing.T) {
+	rows := make(map[string]*types.Knowledge, runtimeTaskNameLookupLimit)
+	tasks := make([]types.RuntimeTaskInfo, 0, runtimeTaskNameLookupLimit)
+	for i := 0; i < runtimeTaskNameLookupLimit; i++ {
+		id := fmt.Sprintf("doc-%03d", i)
+		rows[id] = &types.Knowledge{ID: id, Title: "文档 " + id}
+		tasks = append(tasks, types.RuntimeTaskInfo{ID: id, TenantID: 1, KnowledgeID: id})
+	}
+	h := &SystemHandler{knowledgeNameSvc: fakeRuntimeKnowledgeNamer{rows: rows}}
+	h.enrichRuntimeTaskNames(context.Background(), tasks)
+	for _, task := range tasks {
+		if task.KnowledgeName == "" {
+			t.Fatalf("task %s lost its name on a full page", task.ID)
 		}
 	}
 }

@@ -2027,11 +2027,16 @@ func runtimeTaskPageSize(c *gin.Context) int {
 	return pageSize
 }
 
-// runtimeTaskNameLookupLimit caps per-page name lookups. Knowledge and data
-// source names need one query per distinct ID, model names one per
-// tenant+model pair. A page holds at most 100 tasks; beyond the cap the
-// console just keeps showing the ID.
-const runtimeTaskNameLookupLimit = 60
+// runtimeTaskNameLookupLimit caps per-page per-ID name lookups. Knowledge and
+// data source names need one query per distinct ID, so the cap is the page
+// ceiling (runtimeTaskPageSize caps page_size at 100): every task the console
+// can render in one request gets its names.
+const runtimeTaskNameLookupLimit = 100
+
+// runtimeTaskModelLookupLimit caps per-page model lookups (one query per
+// distinct workspace+model pair). A task carries at most a couple of models,
+// so this still covers a full page of 100 tasks.
+const runtimeTaskModelLookupLimit = 200
 
 // runtimeTaskModelKey identifies one model inside one workspace. Model rows
 // are workspace-scoped, so the same model ID in two workspaces is two rows.
@@ -2213,7 +2218,7 @@ func (h *SystemHandler) resolveRuntimeModelNames(ctx context.Context, tasks []ty
 			if _, ok := seen[key]; ok {
 				continue
 			}
-			if len(keys) >= runtimeTaskNameLookupLimit {
+			if len(keys) >= runtimeTaskModelLookupLimit {
 				return names
 			}
 			seen[key] = struct{}{}
