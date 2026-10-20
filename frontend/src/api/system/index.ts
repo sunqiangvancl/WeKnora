@@ -680,7 +680,28 @@ export interface RuntimeTask {
   data_source_id?: string
   sync_log_id?: string
   knowledge_count?: number
+  // Human-readable names resolved by the backend next to every ID above.
+  // Best-effort: an empty name means the object is gone or unreadable and
+  // the console falls back to showing the ID alone.
+  knowledge_base_name?: string
+  knowledge_name?: string
+  knowledge_file_name?: string
+  tenant_name?: string
+  source_kb_name?: string
+  target_kb_name?: string
+  data_source_name?: string
+  models?: RuntimeTaskModel[]
+  failure_code?: string
+  failure_disposition?: RuntimeTaskFailureDisposition
 }
+
+export interface RuntimeTaskModel {
+  role: string
+  id: string
+  name?: string
+}
+
+export type RuntimeTaskFailureDisposition = 'retryable' | 'deterministic' | 'unknown'
 
 export interface RuntimeTasksResponse {
   available: boolean

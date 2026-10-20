@@ -122,6 +122,32 @@ const RUNTIME_TASK_TYPE_KEYS = [
   'wikiFinalize',
 ] as const
 
+/** Failure codes / dispositions / model roles use dynamic te() paths in RuntimeQueues.vue;
+ *  keep in sync with internal/types/runtime_task_failure.go and the RuntimeTaskModelRole* constants. */
+const RUNTIME_TASK_FAILURE_CODES = [
+  'MODEL_RATE_LIMITED',
+  'MODEL_UPSTREAM_ERROR',
+  'MODEL_AUTH_FAILED',
+  'MODEL_NOT_FOUND',
+  'MODEL_EMPTY_OUTPUT',
+  'MODEL_RESPONSE_INVALID',
+  'DOCREADER_UNAVAILABLE',
+  'DOCREADER_TIMEOUT',
+  'DOCREADER_PARSE_FAILED',
+  'SOURCE_FILE_UNREADABLE',
+  'TASK_TIMEOUT',
+  'TASK_CANCELED',
+  'TASK_INTERRUPTED',
+  'VECTORSTORE_WRITE_FAILED',
+  'EMBEDDING_FAILED',
+  'RESOURCE_GONE',
+  'UNKNOWN',
+] as const
+
+const RUNTIME_TASK_FAILURE_DISPOSITIONS = ['retryable', 'deterministic', 'unknown'] as const
+
+const RUNTIME_TASK_MODEL_ROLES = ['model', 'chat', 'embedding', 'summary', 'asr', 'vlm'] as const
+
 test('registered audit action labels exist as flat keys in every locale', () => {
   const failures: string[] = []
 
@@ -263,6 +289,29 @@ test('runtime queue worker pool and queue labels exist in every locale', () => {
     for (const [localeName, keys] of Object.entries(localeKeysByName) as Array<[LocaleName, Set<string>]>) {
       if (!keys.has(`system.globalSettings.runtime.tasks.taskTypes.${taskType}`)) {
         failures.push(`${localeName}: missing system.globalSettings.runtime.tasks.taskTypes.${taskType}`)
+      }
+    }
+  }
+
+  assert.deepEqual(failures, [], failures.slice(0, 20).join('\n'))
+})
+
+test('runtime task name rows, model roles and inferred failure reasons exist in every locale', () => {
+  const failures: string[] = []
+  const keys = [
+    'system.globalSettings.runtime.tasks.lastErrorLabel',
+    'system.globalSettings.runtime.tasks.failureReasonLabel',
+    ...RUNTIME_TASK_MODEL_ROLES.map((role) => `system.globalSettings.runtime.tasks.modelRoles.${role}`),
+    ...RUNTIME_TASK_FAILURE_DISPOSITIONS.map(
+      (disposition) => `system.globalSettings.runtime.tasks.failureDispositions.${disposition}`,
+    ),
+    ...RUNTIME_TASK_FAILURE_CODES.map((code) => `system.globalSettings.runtime.tasks.failureCodes.${code}`),
+  ]
+
+  for (const key of keys) {
+    for (const [localeName, localeKeys] of Object.entries(localeKeysByName) as Array<[LocaleName, Set<string>]>) {
+      if (!localeKeys.has(key)) {
+        failures.push(`${localeName}: missing ${key}`)
       }
     }
   }

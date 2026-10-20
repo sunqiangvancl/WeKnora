@@ -196,6 +196,10 @@ jobs:
           go test -count=1 ./internal/types/ -run 'Folder|Runtime'
           go test -count=1 ./internal/application/service/ -run 'Folder'
           go test -count=1 ./internal/handler/ -run 'Folder|Runtime'
+          # The task console's projection tests live in ./internal/router/
+          # next to the asynq inspector. 'Runtime' selects the whole
+          # task_inspector_runtime_test.go file.
+          go test -count=1 ./internal/router/ -run 'Runtime'
 
       - name: Run migration 000119 up and down on real PostgreSQL
         # The migration is the only irreversible part of this patch, and it has

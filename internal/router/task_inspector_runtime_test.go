@@ -132,6 +132,66 @@ func TestProjectRuntimeTaskUsesAllowListedBatchMetadata(t *testing.T) {
 	}
 }
 
+// TestProjectRuntimeTaskCarriesModelRolesAndFailureInference pins the
+// console's name/model/reason decorations on the projection side: payload
+// model IDs become ordered role entries, the upload file name is kept as the
+// display fallback, and the last error is classified.
+func TestProjectRuntimeTaskCarriesModelRolesAndFailureInference(t *testing.T) {
+	payload := []byte(`{
+		"tenant_id":42,
+		"knowledge_id":"knowledge-1",
+		"file_name":"要求.xlsx",
+		"summary_model":"model-summary",
+		"embedding_model":"model-embedding",
+		"content":"must-not-be-projected"
+	}`)
+	info, err := projectRuntimeTask(&asynq.TaskInfo{
+		ID: "task-table", Queue: types.QueueSummary, Type: types.TypeDataTableSummary,
+		Payload:  payload,
+		State:    asynq.TaskStateArchived,
+		LastErr:  `failed to create table from Excel file (sheets=[要求 sheet1]): Binder Error: No sheets found in xlsx file (is the file corrupt?)`,
+		MaxRetry: 3, Retried: 3,
+	}, runtimeWorkerMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.KnowledgeFileName != "要求.xlsx" {
+		t.Fatalf("file name fallback = %q", info.KnowledgeFileName)
+	}
+	if len(info.Models) != 2 ||
+		info.Models[0].Role != types.RuntimeTaskModelRoleSummary || info.Models[0].ID != "model-summary" ||
+		info.Models[1].Role != types.RuntimeTaskModelRoleEmbedding || info.Models[1].ID != "model-embedding" {
+		t.Fatalf("model roles = %+v", info.Models)
+	}
+	if info.FailureCode != types.FailureCodeSourceFileUnreadable ||
+		info.FailureDisposition != types.FailureDispositionDeterministic {
+		t.Fatalf("failure inference = %q / %q", info.FailureCode, info.FailureDisposition)
+	}
+}
+
+// TestProjectRuntimeTaskResolvesDocumentIDFallback covers the chat_attachment
+// queue, whose payload names the document "document_id" instead of
+// "knowledge_id", and a task that has not failed yet.
+func TestProjectRuntimeTaskResolvesDocumentIDFallback(t *testing.T) {
+	payload := []byte(`{"tenant_id":7,"document_id":"tmp-doc-1","asr_model_id":"asr-1"}`)
+	info, err := projectRuntimeTask(&asynq.TaskInfo{
+		ID: "task-tmp", Queue: types.QueueChatAttachment, Type: types.TypeTemporaryDocumentProcess,
+		Payload: payload, State: asynq.TaskStatePending,
+	}, runtimeWorkerMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.KnowledgeID != "tmp-doc-1" {
+		t.Fatalf("document_id fallback = %q", info.KnowledgeID)
+	}
+	if len(info.Models) != 1 || info.Models[0].Role != types.RuntimeTaskModelRoleASR || info.Models[0].ID != "asr-1" {
+		t.Fatalf("model roles = %+v", info.Models)
+	}
+	if info.FailureCode != "" || info.FailureDisposition != "" {
+		t.Fatalf("a task without an error must not carry a failure code: %q / %q", info.FailureCode, info.FailureDisposition)
+	}
+}
+
 func TestRuntimeTaskCursorUsesStateTimeOrderAndSurvivingAnchors(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

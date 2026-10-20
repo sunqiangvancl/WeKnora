@@ -80,7 +80,41 @@ type RuntimeTaskInfo struct {
 	DataSourceID    string              `json:"data_source_id,omitempty"`
 	SyncLogID       string              `json:"sync_log_id,omitempty"`
 	KnowledgeCount  int                 `json:"knowledge_count,omitempty"`
+	// Name/model/failure decorations. Names are resolved from Postgres by
+	// the SystemAdmin handler (best-effort: empty means the object is gone
+	// or unresolvable, and clients fall back to the ID). FailureCode is the
+	// inferred reason from the last error string.
+	KnowledgeBaseName  string             `json:"knowledge_base_name,omitempty"`
+	KnowledgeName      string             `json:"knowledge_name,omitempty"`
+	KnowledgeFileName  string             `json:"knowledge_file_name,omitempty"`
+	TenantName         string             `json:"tenant_name,omitempty"`
+	SourceKBName       string             `json:"source_kb_name,omitempty"`
+	TargetKBName       string             `json:"target_kb_name,omitempty"`
+	DataSourceName     string             `json:"data_source_name,omitempty"`
+	Models             []RuntimeTaskModel `json:"models,omitempty"`
+	FailureCode        string             `json:"failure_code,omitempty"`
+	FailureDisposition string             `json:"failure_disposition,omitempty"`
 }
+
+// RuntimeTaskModel names one model a task will call, read from its payload.
+// Role is a stable wire value (see the RuntimeTaskModelRole* constants); the
+// frontend localizes it. Name is resolved from Postgres and stays empty when
+// the model row is gone.
+type RuntimeTaskModel struct {
+	Role string `json:"role"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// RuntimeTaskModelRole* are the stable role values of RuntimeTaskModel.
+const (
+	RuntimeTaskModelRoleDefault   = "model"
+	RuntimeTaskModelRoleChat      = "chat"
+	RuntimeTaskModelRoleEmbedding = "embedding"
+	RuntimeTaskModelRoleSummary   = "summary"
+	RuntimeTaskModelRoleASR       = "asr"
+	RuntimeTaskModelRoleVLM       = "vlm"
+)
 
 // RuntimeRetryAllResult reports what a bulk retry of a queue's archived
 // (finally-failed) tasks did. The three totals partition the archived set as

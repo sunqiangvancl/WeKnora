@@ -55,6 +55,7 @@ type runtimeTaskPayloadProbe struct {
 	KnowledgeBaseID string   `json:"knowledge_base_id,omitempty"`
 	KBID            string   `json:"kb_id,omitempty"`
 	KnowledgeID     string   `json:"knowledge_id,omitempty"`
+	DocumentID      string   `json:"document_id,omitempty"`
 	TaskID          string   `json:"task_id,omitempty"`
 	SourceID        string   `json:"source_id,omitempty"`
 	TargetID        string   `json:"target_id,omitempty"`
@@ -65,6 +66,51 @@ type runtimeTaskPayloadProbe struct {
 	KnowledgeIDs    []string `json:"knowledge_ids,omitempty"`
 	EnqueuedAt      int64    `json:"enqueued_at,omitempty"`
 	CreatedAt       int64    `json:"created_at,omitempty"`
+	// FileName is the upload name carried by document:process payloads. It
+	// is the display fallback when the knowledge row is already gone.
+	FileName string `json:"file_name,omitempty"`
+	// Model keys, most specific first. Every payload type that calls an LLM
+	// or an embedding model carries the model ID in one of these fields.
+	ModelID          string `json:"model_id,omitempty"`
+	ChatModelID      string `json:"chat_model_id,omitempty"`
+	EmbeddingModelID string `json:"embedding_model_id,omitempty"`
+	SummaryModel     string `json:"summary_model,omitempty"`
+	EmbeddingModel   string `json:"embedding_model,omitempty"`
+	ASRModelID       string `json:"asr_model_id,omitempty"`
+	VLMModelID       string `json:"vlm_model_id,omitempty"`
+}
+
+// runtimeTaskModelProbeEntries pairs one payload model key with its stable
+// role value. Order defines the display order in the console.
+var runtimeTaskModelProbeEntries = []struct {
+	role string
+	id   func(runtimeTaskPayloadProbe) string
+}{
+	{types.RuntimeTaskModelRoleDefault, func(p runtimeTaskPayloadProbe) string { return p.ModelID }},
+	{types.RuntimeTaskModelRoleChat, func(p runtimeTaskPayloadProbe) string { return p.ChatModelID }},
+	{types.RuntimeTaskModelRoleEmbedding, func(p runtimeTaskPayloadProbe) string { return p.EmbeddingModelID }},
+	{types.RuntimeTaskModelRoleSummary, func(p runtimeTaskPayloadProbe) string { return p.SummaryModel }},
+	{types.RuntimeTaskModelRoleEmbedding, func(p runtimeTaskPayloadProbe) string { return p.EmbeddingModel }},
+	{types.RuntimeTaskModelRoleASR, func(p runtimeTaskPayloadProbe) string { return p.ASRModelID }},
+	{types.RuntimeTaskModelRoleVLM, func(p runtimeTaskPayloadProbe) string { return p.VLMModelID }},
+}
+
+func runtimeTaskModels(probe runtimeTaskPayloadProbe) []types.RuntimeTaskModel {
+	var models []types.RuntimeTaskModel
+	seen := make(map[types.RuntimeTaskModel]struct{})
+	for _, entry := range runtimeTaskModelProbeEntries {
+		id := entry.id(probe)
+		if id == "" {
+			continue
+		}
+		model := types.RuntimeTaskModel{Role: entry.role, ID: id}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+	return models
 }
 
 // queuesScanned is the fixed set of queue names this codebase enqueues
@@ -392,37 +438,47 @@ func projectRuntimeTask(task *asynq.TaskInfo, worker runtimeWorkerMetadata) (typ
 	if kbID == "" {
 		kbID = probe.KBID
 	}
+	knowledgeID := probe.KnowledgeID
+	if knowledgeID == "" {
+		knowledgeID = probe.DocumentID
+	}
 	enqueuedAt := probe.EnqueuedAt
 	if enqueuedAt == 0 {
 		enqueuedAt = probe.CreatedAt
 	}
 	info := types.RuntimeTaskInfo{
-		ID:              task.ID,
-		Queue:           task.Queue,
-		Type:            task.Type,
-		State:           state,
-		LastError:       task.LastErr,
-		LastFailedAt:    runtimeTaskTime(task.LastFailedAt),
-		NextProcessAt:   runtimeTaskTime(task.NextProcessAt),
-		StartedAt:       runtimeTaskTime(worker.started),
-		CompletedAt:     runtimeTaskTime(task.CompletedAt),
-		Deadline:        runtimeTaskTime(task.Deadline),
-		EnqueuedAt:      runtimePayloadTime(enqueuedAt),
-		Retried:         task.Retried,
-		MaxRetry:        task.MaxRetry,
-		IsOrphaned:      task.IsOrphaned,
-		Worker:          worker.worker,
-		TenantID:        probe.TenantID,
-		KnowledgeBaseID: kbID,
-		KnowledgeID:     probe.KnowledgeID,
-		TaskID:          probe.TaskID,
-		SourceID:        probe.SourceID,
-		TargetID:        probe.TargetID,
-		SourceKBID:      probe.SourceKBID,
-		TargetKBID:      probe.TargetKBID,
-		DataSourceID:    probe.DataSourceID,
-		SyncLogID:       probe.SyncLogID,
-		KnowledgeCount:  len(probe.KnowledgeIDs),
+		ID:                task.ID,
+		Queue:             task.Queue,
+		Type:              task.Type,
+		State:             state,
+		LastError:         task.LastErr,
+		LastFailedAt:      runtimeTaskTime(task.LastFailedAt),
+		NextProcessAt:     runtimeTaskTime(task.NextProcessAt),
+		StartedAt:         runtimeTaskTime(worker.started),
+		CompletedAt:       runtimeTaskTime(task.CompletedAt),
+		Deadline:          runtimeTaskTime(task.Deadline),
+		EnqueuedAt:        runtimePayloadTime(enqueuedAt),
+		Retried:           task.Retried,
+		MaxRetry:          task.MaxRetry,
+		IsOrphaned:        task.IsOrphaned,
+		Worker:            worker.worker,
+		TenantID:          probe.TenantID,
+		KnowledgeBaseID:   kbID,
+		KnowledgeID:       knowledgeID,
+		TaskID:            probe.TaskID,
+		SourceID:          probe.SourceID,
+		TargetID:          probe.TargetID,
+		SourceKBID:        probe.SourceKBID,
+		TargetKBID:        probe.TargetKBID,
+		DataSourceID:      probe.DataSourceID,
+		SyncLogID:         probe.SyncLogID,
+		KnowledgeCount:    len(probe.KnowledgeIDs),
+		KnowledgeFileName: probe.FileName,
+		Models:            runtimeTaskModels(probe),
+	}
+	if task.LastErr != "" {
+		info.FailureCode = types.ClassifyRuntimeTaskFailure(task.LastErr)
+		info.FailureDisposition = types.FailureDispositionForCode(info.FailureCode)
 	}
 	info.AllowedActions = runtimeTaskActions(info)
 	return info, nil

@@ -415,15 +415,36 @@
               <dl v-if="runtimeTaskMeta(task).length > 0" class="rq-failed-row-refs">
                 <div v-for="ref in runtimeTaskMeta(task)" :key="ref.key" class="rq-failed-ref">
                   <dt>{{ ref.label }}</dt>
-                  <dd :title="ref.value">{{ ref.value }}</dd>
+                  <dd :title="ref.name ? `${ref.name} (${ref.value})` : ref.value">
+                    <span v-if="ref.name" class="rq-failed-ref-name">{{ ref.name }}</span>
+                    <span class="rq-failed-ref-id" :class="{ 'rq-failed-ref-id--secondary': ref.name }">{{ ref.value }}</span>
+                  </dd>
                 </div>
               </dl>
               <p v-else class="rq-failed-row-unknown">
                 {{ t('system.globalSettings.runtime.tasks.unknownTarget') }}
               </p>
-              <p v-if="task.last_error" class="rq-failed-row-error">
-                {{ task.last_error }}
-              </p>
+              <div v-if="task.last_error" class="rq-failed-row-failure">
+                <p class="rq-failed-row-failure-label">
+                  {{ t('system.globalSettings.runtime.tasks.lastErrorLabel') }}
+                </p>
+                <p class="rq-failed-row-error">
+                  {{ task.last_error }}
+                </p>
+                <p v-if="task.failure_code" class="rq-failed-row-reason">
+                  <span class="rq-failed-row-reason-label">
+                    {{ t('system.globalSettings.runtime.tasks.failureReasonLabel') }}
+                  </span>
+                  <span class="rq-failed-row-reason-text">{{ runtimeTaskFailureReason(task) }}</span>
+                  <span
+                    v-if="runtimeTaskFailureHint(task)"
+                    class="rq-failure-hint"
+                    :class="runtimeTaskFailureHintClass(task)"
+                  >
+                    {{ runtimeTaskFailureHint(task) }}
+                  </span>
+                </p>
+              </div>
             </div>
 
             <div v-if="task.allowed_actions.length > 0" class="rq-failed-row-actions">
@@ -549,6 +570,12 @@ import { useI18n } from 'vue-i18n'
 import { MessagePlugin } from 'tdesign-vue-next'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
 import { mergeRuntimeTaskPage } from './runtimeTaskPagination'
+import {
+  runtimeTaskFailureDispositionKey,
+  runtimeTaskFailureReasonKey,
+  runtimeTaskMetaRows,
+  runtimeTaskModelRows,
+} from './runtimeTaskDisplay'
 import {
   defaultRetryAllSelection,
   normalizeRetryAllFacets,
@@ -698,6 +725,8 @@ interface RuntimeTaskMeta {
   key: string
   label: string
   value: string
+  // Resolved display name; when present the row renders it above the raw ID.
+  name?: string
 }
 
 function taskStateLabel(state: RuntimeTaskState): string {
@@ -725,42 +754,19 @@ function formatTaskTime(value?: string): string {
 }
 
 function runtimeTaskMeta(task: RuntimeTask): RuntimeTaskMeta[] {
-  const refs: RuntimeTaskMeta[] = []
-  if (task.knowledge_base_id) {
+  const refs: RuntimeTaskMeta[] = runtimeTaskMetaRows(task).map((row) => ({
+    key: row.key,
+    label: t(row.labelKey),
+    value: row.value,
+    name: row.name,
+  }))
+  // One row per model the task calls: role label, resolved model name, raw model ID.
+  for (const row of runtimeTaskModelRows(task)) {
     refs.push({
-      key: 'kb',
-      label: t('system.globalSettings.runtime.tasks.knowledgeBaseLabel'),
-      value: task.knowledge_base_id,
-    })
-  }
-  if (task.knowledge_id) {
-    refs.push({
-      key: 'knowledge',
-      label: t('system.globalSettings.runtime.tasks.knowledgeLabel'),
-      value: task.knowledge_id,
-    })
-  }
-  if (task.task_id) {
-    refs.push({
-      key: 'task',
-      label: t('system.globalSettings.runtime.tasks.taskIDLabel'),
-      value: task.task_id,
-    })
-  }
-  if (task.source_id) refs.push({ key: 'source', label: t('system.globalSettings.runtime.tasks.sourceLabel'), value: task.source_id })
-  if (task.target_id) refs.push({ key: 'target', label: t('system.globalSettings.runtime.tasks.targetLabel'), value: task.target_id })
-  if (task.source_kb_id) refs.push({ key: 'source-kb', label: t('system.globalSettings.runtime.tasks.sourceKBLabel'), value: task.source_kb_id })
-  if (task.target_kb_id) refs.push({ key: 'target-kb', label: t('system.globalSettings.runtime.tasks.targetKBLabel'), value: task.target_kb_id })
-  if (task.data_source_id) refs.push({ key: 'datasource', label: t('system.globalSettings.runtime.tasks.dataSourceLabel'), value: task.data_source_id })
-  if (task.sync_log_id) refs.push({ key: 'sync-log', label: t('system.globalSettings.runtime.tasks.syncLogLabel'), value: task.sync_log_id })
-  if (task.knowledge_count) {
-    refs.push({ key: 'knowledge-count', label: t('system.globalSettings.runtime.tasks.knowledgeCountLabel'), value: String(task.knowledge_count) })
-  }
-  if (task.tenant_id) {
-    refs.push({
-      key: 'tenant',
-      label: t('system.globalSettings.runtime.tasks.tenantLabel'),
-      value: String(task.tenant_id),
+      key: row.key,
+      label: t(row.roleKey),
+      value: row.id,
+      name: row.name,
     })
   }
   if (task.enqueued_at) refs.push({ key: 'enqueued', label: t('system.globalSettings.runtime.tasks.enqueuedAt'), value: formatTaskTime(task.enqueued_at) })
@@ -772,6 +778,20 @@ function runtimeTaskMeta(task: RuntimeTask): RuntimeTaskMeta[] {
   if (task.worker) refs.push({ key: 'worker', label: t('system.globalSettings.runtime.tasks.worker'), value: task.worker })
   if (task.is_orphaned) refs.push({ key: 'orphaned', label: t('system.globalSettings.runtime.tasks.health'), value: t('system.globalSettings.runtime.tasks.orphaned') })
   return refs
+}
+
+function runtimeTaskFailureReason(task: RuntimeTask): string {
+  if (!task.failure_code) return ''
+  return t(runtimeTaskFailureReasonKey(task.failure_code))
+}
+
+function runtimeTaskFailureHint(task: RuntimeTask): string {
+  const key = runtimeTaskFailureDispositionKey(task.failure_disposition)
+  return key ? (t(key) as string) : ''
+}
+
+function runtimeTaskFailureHintClass(task: RuntimeTask): string {
+  return task.failure_disposition ? `rq-failure-hint--${task.failure_disposition}` : ''
 }
 
 function poolLabel(pool: string): string {
@@ -1929,14 +1949,33 @@ onUnmounted(() => {
   }
 
   dd {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
     margin: 0;
-    overflow: hidden;
-    color: var(--td-text-color-secondary);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: var(--app-text-xs);
+    min-width: 0;
     line-height: 1.45;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+}
+
+.rq-failed-ref-name {
+  overflow: hidden;
+  color: var(--td-text-color-primary);
+  font-size: var(--app-text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rq-failed-ref-id {
+  overflow: hidden;
+  color: var(--td-text-color-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--app-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &--secondary {
+    color: var(--td-text-color-placeholder);
   }
 }
 
@@ -1945,6 +1984,50 @@ onUnmounted(() => {
   color: var(--td-text-color-placeholder);
   font-size: var(--app-text-sm);
   line-height: 1.45;
+}
+
+.rq-failed-row-failure-label {
+  margin: 8px 0 0;
+  color: var(--td-text-color-placeholder);
+  font-size: var(--app-text-sm);
+  line-height: 1.45;
+}
+
+.rq-failed-row-reason {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin: 6px 0 0;
+  line-height: 1.45;
+}
+
+.rq-failed-row-reason-label {
+  color: var(--td-text-color-placeholder);
+  font-size: var(--app-text-sm);
+}
+
+.rq-failed-row-reason-text {
+  color: var(--td-text-color-primary);
+  font-size: var(--app-text-sm);
+}
+
+.rq-failure-hint {
+  padding: 1px 6px;
+  border-radius: var(--app-radius-pill);
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-xs);
+  background: var(--td-bg-color-secondarycontainer);
+
+  &--retryable {
+    color: var(--td-success-color);
+    background: var(--td-success-color-1);
+  }
+
+  &--deterministic {
+    color: var(--td-error-color);
+    background: var(--td-error-color-1);
+  }
 }
 
 .rq-failed-row-error {

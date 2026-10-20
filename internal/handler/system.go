@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,27 @@ type runtimeKnowledgeCanceller interface {
 	CancelKnowledgeParse(ctx context.Context, knowledgeID string) (*types.Knowledge, error)
 }
 
+// runtimeKnowledgeNameResolver resolves a document name without tenant
+// scoping. The SystemAdmin route is the gate for the cross-workspace read;
+// the same pattern as the console's cancellation path.
+type runtimeKnowledgeNameResolver interface {
+	GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error)
+}
+
+// The runtime console resolves names through these narrow views so unit
+// tests can wire tiny fakes instead of the full service interfaces.
+type runtimeKnowledgeBaseNamer interface {
+	GetKnowledgeBasesByIDsOnly(ctx context.Context, ids []string) ([]*types.KnowledgeBase, error)
+}
+
+type runtimeModelNamer interface {
+	GetModelByID(ctx context.Context, id string) (*types.Model, error)
+}
+
+type runtimeDataSourceNamer interface {
+	GetDataSource(ctx context.Context, id string) (*types.DataSource, error)
+}
+
 // SystemHandler handles system-related requests
 type SystemHandler struct {
 	cfg              *config.Config
@@ -61,6 +83,16 @@ type SystemHandler struct {
 	// runtime task console. It updates business state and tracing before queue
 	// records are removed, unlike a raw Redis deletion.
 	knowledgeSvc runtimeKnowledgeCanceller
+	// knowledgeNameSvc resolves document names for the runtime task console.
+	// Optional — nil in partially-wired unit tests, in which case knowledge
+	// names stay empty and the console falls back to the ID.
+	knowledgeNameSvc runtimeKnowledgeNameResolver
+	// kbSvc, modelSvc and dataSourceSvc resolve the human-readable names the
+	// runtime task console shows next to every ID. Optional for the same
+	// reason as knowledgeNameSvc.
+	kbSvc         runtimeKnowledgeBaseNamer
+	modelSvc      runtimeModelNamer
+	dataSourceSvc runtimeDataSourceNamer
 	// storageBackendRepo lets GetStorageEngineStatus report multi-instance
 	// storage backends (Settings → Storage) as "available", not just the legacy
 	// singleton tenant.StorageEngineConfig. Optional — nil in partially-wired
@@ -85,6 +117,9 @@ func NewSystemHandler(cfg *config.Config,
 	knowledgeSvc interfaces.KnowledgeService,
 	storageBackendRepo interfaces.StorageBackendRepository,
 	sandboxConfigSvc *service.TenantSandboxConfigService,
+	kbSvc interfaces.KnowledgeBaseService,
+	modelSvc interfaces.ModelService,
+	dataSourceSvc interfaces.DataSourceService,
 ) *SystemHandler {
 	return &SystemHandler{
 		cfg:                cfg,
@@ -98,8 +133,12 @@ func NewSystemHandler(cfg *config.Config,
 		auditSvc:           auditSvc,
 		taskInspector:      taskInspector,
 		knowledgeSvc:       knowledgeSvc,
+		knowledgeNameSvc:   knowledgeSvc,
 		storageBackendRepo: storageBackendRepo,
 		sandboxConfigSvc:   sandboxConfigSvc,
+		kbSvc:              kbSvc,
+		modelSvc:           modelSvc,
+		dataSourceSvc:      dataSourceSvc,
 	}
 }
 
@@ -1988,6 +2027,215 @@ func runtimeTaskPageSize(c *gin.Context) int {
 	return pageSize
 }
 
+// runtimeTaskNameLookupLimit caps per-page name lookups. Knowledge and data
+// source names need one query per distinct ID, model names one per
+// tenant+model pair. A page holds at most 100 tasks; beyond the cap the
+// console just keeps showing the ID.
+const runtimeTaskNameLookupLimit = 60
+
+// runtimeTaskModelKey identifies one model inside one workspace. Model rows
+// are workspace-scoped, so the same model ID in two workspaces is two rows.
+type runtimeTaskModelKey struct {
+	tenantID uint64
+	modelID  string
+}
+
+func addRuntimeTaskID(set map[string]struct{}, id string) {
+	if id != "" {
+		set[id] = struct{}{}
+	}
+}
+
+func sortedRuntimeTaskIDs(set map[string]struct{}) []string {
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// enrichRuntimeTaskNames decorates runtime tasks with the human-readable
+// names behind their IDs: knowledge base, document, workspace, data source
+// and model names. Every lookup is best-effort — a missing row or a resolver
+// error leaves that name empty and the console falls back to the ID. This
+// runs only on the SystemAdmin console, which is already gated by the
+// route-level SystemAdmin check.
+func (h *SystemHandler) enrichRuntimeTaskNames(ctx context.Context, tasks []types.RuntimeTaskInfo) {
+	if len(tasks) == 0 {
+		return
+	}
+	kbIDs := map[string]struct{}{}
+	knowledgeIDs := map[string]struct{}{}
+	tenantIDs := map[uint64]struct{}{}
+	dataSourceIDs := map[string]struct{}{}
+	for _, task := range tasks {
+		addRuntimeTaskID(kbIDs, task.KnowledgeBaseID)
+		addRuntimeTaskID(kbIDs, task.SourceKBID)
+		addRuntimeTaskID(kbIDs, task.TargetKBID)
+		if task.Type == types.TypeKBClone {
+			// kb:clone carries two knowledge base IDs in the generic
+			// source/target slots.
+			addRuntimeTaskID(kbIDs, task.SourceID)
+			addRuntimeTaskID(kbIDs, task.TargetID)
+		}
+		addRuntimeTaskID(knowledgeIDs, task.KnowledgeID)
+		addRuntimeTaskID(dataSourceIDs, task.DataSourceID)
+		if task.TenantID != 0 {
+			tenantIDs[task.TenantID] = struct{}{}
+		}
+	}
+
+	kbNames := h.resolveRuntimeKnowledgeBaseNames(ctx, sortedRuntimeTaskIDs(kbIDs))
+	knowledgeNames := h.resolveRuntimeKnowledgeNames(ctx, sortedRuntimeTaskIDs(knowledgeIDs))
+	tenantNames := h.resolveRuntimeTenantNames(ctx, tenantIDs)
+	dataSourceNames := h.resolveRuntimeDataSourceNames(ctx, sortedRuntimeTaskIDs(dataSourceIDs))
+	modelNames := h.resolveRuntimeModelNames(ctx, tasks)
+
+	for index := range tasks {
+		task := &tasks[index]
+		task.KnowledgeBaseName = kbNames[task.KnowledgeBaseID]
+		if task.Type == types.TypeKBClone {
+			task.SourceKBName = kbNames[task.SourceID]
+			task.TargetKBName = kbNames[task.TargetID]
+		} else {
+			task.SourceKBName = kbNames[task.SourceKBID]
+			task.TargetKBName = kbNames[task.TargetKBID]
+		}
+		task.KnowledgeName = knowledgeNames[task.KnowledgeID]
+		task.TenantName = tenantNames[task.TenantID]
+		task.DataSourceName = dataSourceNames[task.DataSourceID]
+		for modelIndex := range task.Models {
+			key := runtimeTaskModelKey{tenantID: task.TenantID, modelID: task.Models[modelIndex].ID}
+			task.Models[modelIndex].Name = modelNames[key]
+		}
+	}
+}
+
+func (h *SystemHandler) resolveRuntimeKnowledgeBaseNames(ctx context.Context, ids []string) map[string]string {
+	names := make(map[string]string, len(ids))
+	if h.kbSvc == nil || len(ids) == 0 {
+		return names
+	}
+	bases, err := h.kbSvc.GetKnowledgeBasesByIDsOnly(ctx, ids)
+	if err != nil {
+		logger.Warnf(ctx, "resolve runtime task knowledge base names: %v", err)
+		return names
+	}
+	for _, base := range bases {
+		if base == nil || base.Name == "" {
+			continue
+		}
+		names[base.ID] = base.Name
+	}
+	return names
+}
+
+func (h *SystemHandler) resolveRuntimeKnowledgeNames(ctx context.Context, ids []string) map[string]string {
+	names := make(map[string]string, len(ids))
+	if h.knowledgeNameSvc == nil {
+		return names
+	}
+	for index, id := range ids {
+		if index >= runtimeTaskNameLookupLimit {
+			break
+		}
+		knowledge, err := h.knowledgeNameSvc.GetKnowledgeByIDOnly(ctx, id)
+		if err != nil || knowledge == nil {
+			continue
+		}
+		name := strings.TrimSpace(knowledge.Title)
+		if name == "" {
+			name = strings.TrimSpace(knowledge.FileName)
+		}
+		if name != "" {
+			names[id] = name
+		}
+	}
+	return names
+}
+
+func (h *SystemHandler) resolveRuntimeTenantNames(ctx context.Context, ids map[uint64]struct{}) map[uint64]string {
+	names := make(map[uint64]string, len(ids))
+	if h.tenantSvc == nil || len(ids) == 0 {
+		return names
+	}
+	tenantIDs := make([]uint64, 0, len(ids))
+	for id := range ids {
+		tenantIDs = append(tenantIDs, id)
+	}
+	sort.Slice(tenantIDs, func(i, j int) bool { return tenantIDs[i] < tenantIDs[j] })
+	tenants, err := h.tenantSvc.GetTenantsByIDs(ctx, tenantIDs)
+	if err != nil {
+		logger.Warnf(ctx, "resolve runtime task workspace names: %v", err)
+		return names
+	}
+	for id, tenant := range tenants {
+		if tenant == nil || tenant.Name == "" {
+			continue
+		}
+		names[id] = tenant.Name
+	}
+	return names
+}
+
+func (h *SystemHandler) resolveRuntimeDataSourceNames(ctx context.Context, ids []string) map[string]string {
+	names := make(map[string]string, len(ids))
+	if h.dataSourceSvc == nil {
+		return names
+	}
+	for index, id := range ids {
+		if index >= runtimeTaskNameLookupLimit {
+			break
+		}
+		source, err := h.dataSourceSvc.GetDataSource(ctx, id)
+		if err != nil || source == nil || source.Name == "" {
+			continue
+		}
+		names[id] = source.Name
+	}
+	return names
+}
+
+func (h *SystemHandler) resolveRuntimeModelNames(ctx context.Context, tasks []types.RuntimeTaskInfo) map[runtimeTaskModelKey]string {
+	names := map[runtimeTaskModelKey]string{}
+	if h.modelSvc == nil {
+		return names
+	}
+	keys := make([]runtimeTaskModelKey, 0, len(tasks))
+	seen := map[runtimeTaskModelKey]struct{}{}
+	for _, task := range tasks {
+		for _, model := range task.Models {
+			if model.ID == "" || task.TenantID == 0 {
+				continue
+			}
+			key := runtimeTaskModelKey{tenantID: task.TenantID, modelID: model.ID}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			if len(keys) >= runtimeTaskNameLookupLimit {
+				return names
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		model, err := h.modelSvc.GetModelByID(types.WithExecutionTenant(ctx, key.tenantID), key.modelID)
+		if err != nil || model == nil {
+			continue
+		}
+		name := strings.TrimSpace(model.DisplayName)
+		if name == "" {
+			name = strings.TrimSpace(model.Name)
+		}
+		if name != "" {
+			names[key] = name
+		}
+	}
+	return names
+}
+
 func (h *SystemHandler) listRuntimeTasks(c *gin.Context, state types.RuntimeTaskState) {
 	queue := c.Param("queue")
 	if !isKnownRuntimeQueue(queue) {
@@ -2032,6 +2280,7 @@ func (h *SystemHandler) listRuntimeTasks(c *gin.Context, state types.RuntimeTask
 	if page.Tasks == nil {
 		page.Tasks = []types.RuntimeTaskInfo{}
 	}
+	h.enrichRuntimeTaskNames(c.Request.Context(), page.Tasks)
 	c.JSON(http.StatusOK, RuntimeTasksResponse{
 		Available:  supported,
 		Tasks:      page.Tasks,
