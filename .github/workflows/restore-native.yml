@@ -36,12 +36,6 @@ jobs:
           curl -L --fail --retry 3 \
             "https://codeload.github.com/${GITHUB_REPOSITORY}/legacy.tar.gz/${NATIVE_COMMIT}" \
             | tar -xz -C native-src --strip-components=1
-      - name: Build frontend assets
-        working-directory: native-src/frontend
-        run: |
-          npm ci --prefer-offline --no-audit --no-fund
-          npm run build
-          test -f dist/index.html
       - name: Show toolchain
         run: |
           go version
