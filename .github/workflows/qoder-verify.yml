@@ -1,0 +1,48 @@
+name: Qoder verify (temporary)
+
+on:
+  push:
+    branches:
+      - sync/upstream-main-20261118
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: SQLite wiki source-ref tests
+        env:
+          CGO_ENABLED: "1"
+          GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
+        run: |
+          go test -tags sqlite_fts5 -count=1 ./internal/application/repository \
+            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite|Search_SQLiteRanks)'
+      - name: Types package (jieba embed)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -tags sqlite_fts5 -count=1 ./internal/types
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci --prefer-offline
+          npm run build
