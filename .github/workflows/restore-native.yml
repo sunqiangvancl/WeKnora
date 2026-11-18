@@ -1,4 +1,4 @@
-name: Restore native branch and build arm64
+name: Build native arm64 DMG
 
 on:
   push:
@@ -8,43 +8,106 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
-  restore:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: macos-15-intel
+    env:
+      CGO_ENABLED: "1"
+      EDITION: lite
+      GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
     steps:
       - uses: actions/checkout@v4
-      - name: Restore native branch from commit tarball
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Download native source
         env:
-          GH_TOKEN: ${{ github.token }}
           NATIVE_COMMIT: 9af34566ed9f2077d1ad9b80829c9713341798cc
         run: |
-          set -euo pipefail
-          trap 'echo "::error::restore failed at line ${LINENO}"' ERR
-          echo "::notice::downloading native source tarball"
+          rm -rf native-src
+          mkdir -p native-src
           curl -L --fail --retry 3 \
             "https://codeload.github.com/${GITHUB_REPOSITORY}/legacy.tar.gz/${NATIVE_COMMIT}" \
-            -o /tmp/native.tar.gz
-          echo "::notice::extracting"
-          rm -rf /tmp/native-src
-          mkdir -p /tmp/native-src
-          tar -xzf /tmp/native.tar.gz -C /tmp/native-src --strip-components=1
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git checkout -B sync/upstream-main-20261118
-          rsync -a --delete --exclude=.git /tmp/native-src/ ./
-          echo "::notice::patching workflow for arm64 and web assets"
-          wf=.github/workflows/qoder-verify.yml
-          sed -i 's|-platform darwin/universal|-platform darwin/arm64|' "$wf"
-          sed -i 's|WeKnora-Lite-App_macOS_universal.dmg|WeKnora-Lite-App_macOS_arm64.dmg|g' "$wf"
-          sed -i 's|name: desktop-macos-universal-dmg|name: desktop-macos-arm64-dmg|' "$wf"
-          sed -i 's|if \[ -d web \]; then cp -r web "${RES}/"; fi|mkdir -p "${RES}/web" \&\& cp -R frontend/dist/. "${RES}/web/"|' "$wf"
-          grep -q 'platform darwin/arm64' "$wf"
-          grep -q 'frontend/dist/. "${RES}/web/"' "$wf"
-          git add -A
-          git commit -m 'feat(desktop): restore native parser; package web assets; arm64 DMG'
-          echo "::notice::pushing restored branch"
-          git push --force origin HEAD:refs/heads/sync/upstream-main-20261118
-          echo "::notice::dispatching verification/build"
-          gh workflow run qoder-verify.yml --ref sync/upstream-main-20261118
+            | tar -xz -C native-src --strip-components=1
+      - name: Show toolchain
+        run: |
+          go version
+          node --version
+          xcodebuild -version
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Build native PDF helper
+        working-directory: native-src
+        run: |
+          swiftc -O -target arm64-apple-macosx12.0 tools/pdf2md/pdf2md.swift -o /tmp/pdf2md-arm64
+          swiftc -O -target x86_64-apple-macosx12.0 tools/pdf2md/pdf2md.swift -o /tmp/pdf2md-amd64
+          lipo -create /tmp/pdf2md-arm64 /tmp/pdf2md-amd64 -output /tmp/pdf2md
+          chmod +x /tmp/pdf2md
+          /tmp/pdf2md internal/infrastructure/docparser/anydoc/testdata/upstream/pdf/text.pdf > /tmp/native-pdf.md
+          test -s /tmp/native-pdf.md
+      - name: Build desktop app (arm64)
+        working-directory: native-src
+        run: |
+          set -o pipefail
+          bash ./scripts/check-license-bundle.sh
+          eval "$(./scripts/get_version.sh env)"
+          LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+          export CGO_CFLAGS="-Wno-deprecated-declarations"
+          export CGO_LDFLAGS="-Wl,-no_warn_duplicate_libraries"
+          cd cmd/desktop
+          wails build -clean -tags "sqlite_fts5" -platform darwin/arm64 \
+            -ldflags="$LDFLAGS" -o "WeKnora Lite"
+      - name: Package macOS app
+        working-directory: native-src
+        run: |
+          APP="cmd/desktop/build/bin/WeKnora Lite.app"
+          RES="${APP}/Contents/Resources"
+          mkdir -p "${RES}/config" "${RES}/migrations/sqlite"
+          if [ -f scripts/copy-licenses.sh ]; then bash ./scripts/copy-licenses.sh "${RES}"; fi
+          cp .env.lite.example "${RES}/.env"
+          cp -r migrations/sqlite/* "${RES}/migrations/sqlite/"
+          cp -r config/* "${RES}/config/"
+          rm -rf "${RES}/web"
+          mkdir -p "${RES}/web"
+          cp -R frontend/dist/. "${RES}/web/"
+          cp /tmp/pdf2md "${RES}/pdf2md"
+          chmod +x "${RES}/pdf2md"
+          codesign --force --sign - "${RES}/pdf2md" || true
+          codesign --force --deep --sign - "${APP}" || true
+          DMG_NAME="WeKnora-Lite-App_macOS_arm64.dmg"
+          STAGE="dmg_staging"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}"
+          cp -R "${APP}" "${STAGE}/"
+          ln -s /Applications "${STAGE}/Applications"
+          hdiutil create -volname "WeKnora Lite" -srcfolder "${STAGE}" \
+            -ov -format UDZO "${DMG_NAME}"
+          shasum -a 256 "${DMG_NAME}" > "${DMG_NAME}.sha256"
+          rm -rf "${STAGE}"
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos-arm64-dmg
+          path: |
+            native-src/WeKnora-Lite-App_macOS_arm64.dmg
+            native-src/WeKnora-Lite-App_macOS_arm64.dmg.sha256
+          retention-days: 7
+      - name: Publish DMG prerelease
+        working-directory: native-src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="qoder-desktop-arm64-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            "WeKnora-Lite-App_macOS_arm64.dmg" \
+            "WeKnora-Lite-App_macOS_arm64.dmg.sha256" \
+            --title "WeKnora Lite macOS arm64 (Qoder build ${GITHUB_RUN_NUMBER})" \
+            --notes "Native parser build (PDF/Office/HTML) from commit 9af3456. macOS arm64, ad-hoc signed, not notarized." \
+            --prerelease
