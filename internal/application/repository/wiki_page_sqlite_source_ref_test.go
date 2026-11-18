@@ -7,10 +7,27 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+// seedWikiSourceRefTestKnowledgeBases creates the minimal KB rows that
+// WikiPageRepository.Create requires. The shared wiki test DDL only covers
+// wiki tables, not knowledge_bases.
+func seedWikiSourceRefTestKnowledgeBases(t *testing.T, db *gorm.DB, ids ...string) {
+	t.Helper()
+	require.NoError(t, db.Exec(`CREATE TABLE IF NOT EXISTS knowledge_bases (
+		id VARCHAR(36) PRIMARY KEY,
+		tenant_id INTEGER NOT NULL,
+		deleted_at DATETIME
+	)`).Error)
+	for _, id := range ids {
+		require.NoError(t, db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES (?, 1)`, id).Error)
+	}
+}
 
 func TestListBySourceRef_SQLiteMatchesExactAndTitledRefs(t *testing.T) {
 	db := setupWikiPagesTestDB(t)
+	seedWikiSourceRefTestKnowledgeBases(t, db, "kb-src", "kb-other")
 	repo := NewWikiPageRepository(db)
 	ctx := context.Background()
 
@@ -48,6 +65,7 @@ func TestListBySourceRef_SQLiteMatchesExactAndTitledRefs(t *testing.T) {
 
 func TestListSummariesByKnowledgeIDs_SQLiteMatchesSourceRefs(t *testing.T) {
 	db := setupWikiPagesTestDB(t)
+	seedWikiSourceRefTestKnowledgeBases(t, db, "kb-src", "kb-other")
 	repo := NewWikiPageRepository(db)
 	ctx := context.Background()
 
