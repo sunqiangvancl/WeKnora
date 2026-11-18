@@ -16,6 +16,7 @@ jobs:
       CGO_ENABLED: "1"
       EDITION: lite
       GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
+      NODE_OPTIONS: "--max-old-space-size=8192"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -36,6 +37,16 @@ jobs:
           curl -L --fail --retry 3 \
             "https://codeload.github.com/${GITHUB_REPOSITORY}/legacy.tar.gz/${NATIVE_COMMIT}" \
             | tar -xz -C native-src --strip-components=1
+      - name: Build frontend assets
+        working-directory: native-src
+        run: |
+          cd frontend
+          npm ci --prefer-offline --no-audit --no-fund
+          npm run build
+          test -f dist/index.html
+          cd ..
+          rm -rf web
+          cp -R frontend/dist web
       - name: Show toolchain
         run: |
           go version
@@ -69,8 +80,8 @@ jobs:
         run: |
           set -euo pipefail
           trap 'echo "::error::package failed at line ${LINENO}"' ERR
-          echo "::notice::checking frontend/dist"
-          test -f frontend/dist/index.html
+          echo "::notice::checking web assets"
+          test -f web/index.html
           APP="cmd/desktop/build/bin/WeKnora Lite.app"
           RES="${APP}/Contents/Resources"
           mkdir -p "${RES}/config" "${RES}/migrations/sqlite"
@@ -80,7 +91,7 @@ jobs:
           cp -r config/* "${RES}/config/"
           rm -rf "${RES}/web"
           mkdir -p "${RES}/web"
-          cp -R frontend/dist/. "${RES}/web/"
+          cp -R web/. "${RES}/web/"
           cp /tmp/pdf2md "${RES}/pdf2md"
           chmod +x "${RES}/pdf2md"
           codesign --force --sign - "${RES}/pdf2md" || true
