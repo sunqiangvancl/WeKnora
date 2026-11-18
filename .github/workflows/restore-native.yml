@@ -1,0 +1,52 @@
+name: Restore native branch and build arm64
+
+on:
+  push:
+    paths:
+      - .github/workflows/restore-native.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore native branch from commit tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_COMMIT: 9af34566ed9f2077d1ad9b80829c9713341798cc
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${NATIVE_COMMIT}" \
+            -o /tmp/native.tar.gz
+          rm -rf /tmp/native-src
+          mkdir -p /tmp/native-src
+          tar -xzf /tmp/native.tar.gz -C /tmp/native-src --strip-components=1
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout -B sync/upstream-main-20261118
+          rsync -a --delete --exclude=.git /tmp/native-src/ ./
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/qoder-verify.yml')
+          t = p.read_text()
+          t = t.replace('-platform darwin/universal', '-platform darwin/arm64')
+          t = t.replace('WeKnora-Lite-App_macOS_universal.dmg', 'WeKnora-Lite-App_macOS_arm64.dmg')
+          t = t.replace('name: desktop-macos-universal-dmg', 'name: desktop-macos-arm64-dmg')
+          t = t.replace('macOS universal, ad-hoc signed', 'macOS arm64, ad-hoc signed')
+          old = 'if [ -d web ]; then cp -r web "${RES}/"; fi'
+          new = 'rm -rf "${RES}/web"\n          mkdir -p "${RES}/web"\n          cp -R frontend/dist/. "${RES}/web/"'
+          if old not in t:
+              raise SystemExit('web-copy patch target not found')
+          t = t.replace(old, new, 1)
+          p.write_text(t)
+          PY
+          git add -A
+          git commit -m 'feat(desktop): restore native parser; package web assets; arm64 DMG'
+          git push --force origin HEAD:refs/heads/sync/upstream-main-20261118
+          gh workflow run qoder-verify.yml --ref sync/upstream-main-20261118
