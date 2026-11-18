@@ -21,9 +21,12 @@ jobs:
           NATIVE_COMMIT: 9af34566ed9f2077d1ad9b80829c9713341798cc
         run: |
           set -euo pipefail
+          trap 'echo "::error::restore failed at line ${LINENO}"' ERR
+          echo "::notice::downloading native source tarball"
           curl -L --fail --retry 3 \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${NATIVE_COMMIT}" \
+            "https://codeload.github.com/${GITHUB_REPOSITORY}/legacy.tar.gz/${NATIVE_COMMIT}" \
             -o /tmp/native.tar.gz
+          echo "::notice::extracting"
           rm -rf /tmp/native-src
           mkdir -p /tmp/native-src
           tar -xzf /tmp/native.tar.gz -C /tmp/native-src --strip-components=1
@@ -31,22 +34,17 @@ jobs:
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git checkout -B sync/upstream-main-20261118
           rsync -a --delete --exclude=.git /tmp/native-src/ ./
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('.github/workflows/qoder-verify.yml')
-          t = p.read_text()
-          t = t.replace('-platform darwin/universal', '-platform darwin/arm64')
-          t = t.replace('WeKnora-Lite-App_macOS_universal.dmg', 'WeKnora-Lite-App_macOS_arm64.dmg')
-          t = t.replace('name: desktop-macos-universal-dmg', 'name: desktop-macos-arm64-dmg')
-          t = t.replace('macOS universal, ad-hoc signed', 'macOS arm64, ad-hoc signed')
-          old = 'if [ -d web ]; then cp -r web "${RES}/"; fi'
-          new = 'rm -rf "${RES}/web"\n          mkdir -p "${RES}/web"\n          cp -R frontend/dist/. "${RES}/web/"'
-          if old not in t:
-              raise SystemExit('web-copy patch target not found')
-          t = t.replace(old, new, 1)
-          p.write_text(t)
-          PY
+          echo "::notice::patching workflow for arm64 and web assets"
+          wf=.github/workflows/qoder-verify.yml
+          sed -i 's|-platform darwin/universal|-platform darwin/arm64|' "$wf"
+          sed -i 's|WeKnora-Lite-App_macOS_universal.dmg|WeKnora-Lite-App_macOS_arm64.dmg|g' "$wf"
+          sed -i 's|name: desktop-macos-universal-dmg|name: desktop-macos-arm64-dmg|' "$wf"
+          sed -i 's|if \[ -d web \]; then cp -r web "${RES}/"; fi|mkdir -p "${RES}/web" \&\& cp -R frontend/dist/. "${RES}/web/"|' "$wf"
+          grep -q 'platform darwin/arm64' "$wf"
+          grep -q 'frontend/dist/. "${RES}/web/"' "$wf"
           git add -A
           git commit -m 'feat(desktop): restore native parser; package web assets; arm64 DMG'
+          echo "::notice::pushing restored branch"
           git push --force origin HEAD:refs/heads/sync/upstream-main-20261118
+          echo "::notice::dispatching verification/build"
           gh workflow run qoder-verify.yml --ref sync/upstream-main-20261118
