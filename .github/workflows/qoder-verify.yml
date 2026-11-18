@@ -25,22 +25,31 @@ jobs:
           CGO_ENABLED: "1"
           GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
         run: |
+          set +e
           go test -tags sqlite_fts5 -count=1 -v ./internal/application/repository \
-            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite)'
+            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite)' \
+            2>&1 | tee /tmp/source-ref-test.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^(--- FAIL|FAIL|panic:|# |.*\.go:[0-9]+:)' /tmp/source-ref-test.log | head -30 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
+          exit "$rc"
       - name: Types package (jieba embed)
         env:
           CGO_ENABLED: "1"
         run: go test -tags sqlite_fts5 -count=1 ./internal/types
-      - name: Capture test failure
+      - name: Publish test failure log
         if: failure()
         env:
           CGO_ENABLED: "1"
           GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
         run: |
-          set +e
+          set -e
           go test -tags sqlite_fts5 -count=1 -v ./internal/application/repository \
             -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite)' \
-            > /tmp/source-ref.log 2>&1
+            > /tmp/source-ref.log 2>&1 || true
           cp /tmp/source-ref.log ci-source-ref-failure.log
           {
             echo '## Source-ref test failure'
@@ -50,9 +59,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add ci-source-ref-failure.log
+          git add -f ci-source-ref-failure.log
           git commit -m 'ci: capture source-ref failure [skip ci]'
-          git push origin HEAD:refs/heads/sync/upstream-main-20261118
+          git push -f origin HEAD:refs/heads/ci-source-ref-log
 
   frontend:
     runs-on: ubuntu-latest
