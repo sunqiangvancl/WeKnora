@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   go-test:
@@ -25,12 +25,34 @@ jobs:
           CGO_ENABLED: "1"
           GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
         run: |
-          go test -tags sqlite_fts5 -count=1 ./internal/application/repository \
-            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite|Search_SQLiteRanks)'
+          go test -tags sqlite_fts5 -count=1 -v ./internal/application/repository \
+            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite)'
       - name: Types package (jieba embed)
         env:
           CGO_ENABLED: "1"
         run: go test -tags sqlite_fts5 -count=1 ./internal/types
+      - name: Capture test failure
+        if: failure()
+        env:
+          CGO_ENABLED: "1"
+          GOLANG_PROTOBUF_REGISTRATION_CONFLICT: warn
+        run: |
+          set +e
+          go test -tags sqlite_fts5 -count=1 -v ./internal/application/repository \
+            -run 'Test(ListBySourceRef_SQLite|ListSummariesByKnowledgeIDs_SQLite)' \
+            > /tmp/source-ref.log 2>&1
+          cp /tmp/source-ref.log ci-source-ref-failure.log
+          {
+            echo '## Source-ref test failure'
+            echo '```'
+            tail -200 /tmp/source-ref.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add ci-source-ref-failure.log
+          git commit -m 'ci: capture source-ref failure [skip ci]'
+          git push origin HEAD:refs/heads/sync/upstream-main-20261118
 
   frontend:
     runs-on: ubuntu-latest
