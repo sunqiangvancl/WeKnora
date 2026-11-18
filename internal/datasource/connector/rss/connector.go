@@ -124,7 +124,7 @@ func (c *Connector) FetchAll(
 	return items, err
 }
 
-// FetchIncremental returns only items whose content fingerprint changed since
+// FetchIncremental returns only items whose item fingerprint changed since
 // the prior cursor. Deletions are intentionally not emitted (feeds drop old
 // items as a matter of course).
 func (c *Connector) FetchIncremental(
@@ -171,7 +171,7 @@ func (c *Connector) FetchIncremental(
 
 // walk is the shared implementation for FetchAll / FetchIncremental.
 //
-// When incremental is true, items whose feed signal and content fingerprint are
+// When incremental is true, items whose feed signal and item fingerprint are
 // both unchanged are omitted from the result (ingest skipped) without fetching
 // article pages. The returned cursor always reflects the best-known item state
 // so a later sync can detect changes.
@@ -195,6 +195,7 @@ func (c *Connector) walk(
 
 	cli := newClient(cfg.parseHeaders())
 	parser := gofeed.NewParser()
+	parser.JSONTranslator = &jsonFeedTranslator{}
 
 	newCursor := &rssCursor{
 		LastSyncTime: time.Now().UTC(),
@@ -205,6 +206,9 @@ func (c *Connector) walk(
 	var feedErrors []string
 
 	for _, feedURL := range feedURLs {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		data, err := cli.fetchFeed(ctx, feedURL)
 		if err != nil {
 			logger.Warnf(ctx, "[RSS] sync: fetch %s failed: %v", feedURL, err)
@@ -250,7 +254,9 @@ func (c *Connector) walk(
 				if prevSignals != nil {
 					prevSig = prevSignals[itemID]
 				}
-				if prevFP != "" && feedSig == prevSig {
+				// Body-only legacy cursors must be upgraded (below) before the
+				// no-fetch fast path can trust them.
+				if strings.HasPrefix(prevFP, itemFingerprintPrefix) && feedSig == prevSig {
 					newCursor.FeedItems[feedURL][itemID] = prevFP
 					newCursor.FeedSignals[feedURL][itemID] = feedSig
 					skipped++
@@ -259,8 +265,44 @@ func (c *Connector) walk(
 			}
 
 			resolved := c.resolveItem(ctx, cli, feed, item, feedURL, itemID, feedContent)
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			if incremental && resolved.articleFailed && prevItems[itemID] != "" && prevSignals[itemID] != "" {
+				// A cached signal records a successful resolution. Preserve its body
+				// and old signal so a changed entry retries without replacing the full
+				// article with a summary, including across repeated failures.
+				newCursor.FeedItems[feedURL][itemID] = prevItems[itemID]
+				newCursor.FeedSignals[feedURL][itemID] = prevSignals[itemID]
+				skipped++
+				continue
+			}
+			if incremental && prevItems != nil && isLegacyFingerprint(prevItems[itemID]) {
+				switch {
+				case legacyContentFingerprint(string(resolved.item.Content)) == prevItems[itemID]:
+					// The stored body is unchanged: upgrade the cursor in place
+					// instead of deleting and rebuilding the document.
+					newCursor.FeedItems[feedURL][itemID] = resolved.fingerprint
+					if !resolved.articleFailed {
+						newCursor.FeedSignals[feedURL][itemID] = feedSig
+					}
+					skipped++
+					continue
+				case resolved.articleFailed:
+					// A transient article failure must not replace the stored
+					// full text with the feed summary: keep the legacy cursor
+					// and retry on the next sync.
+					newCursor.FeedItems[feedURL][itemID] = prevItems[itemID]
+					skipped++
+					continue
+				}
+			}
 			newCursor.FeedItems[feedURL][itemID] = resolved.fingerprint
-			newCursor.FeedSignals[feedURL][itemID] = feedSig
+			// Keep fallback deduplication, but retry failed full-text extraction on
+			// the next sync even when the feed entry itself has not changed.
+			if !resolved.articleFailed {
+				newCursor.FeedSignals[feedURL][itemID] = feedSig
+			}
 
 			if incremental && prevItems != nil && prevItems[itemID] == resolved.fingerprint {
 				skipped++
@@ -274,6 +316,12 @@ func (c *Connector) walk(
 			feedURL, len(feed.Items), kept, skipped)
 	}
 
+	// The caller may persist a returned cursor even on fetch failure.
+	// Discard the interrupted batch so a retry starts from the prior cursor.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	if len(feedErrors) > 0 {
 		if len(out) == 0 && len(feedErrors) == len(feedURLs) {
 			return nil, newCursor, fmt.Errorf("all feeds failed: %s", strings.Join(feedErrors, "; "))
@@ -285,8 +333,9 @@ func (c *Connector) walk(
 }
 
 type resolvedFeedItem struct {
-	item        types.FetchedItem
-	fingerprint string
+	item          types.FetchedItem
+	fingerprint   string
+	articleFailed bool
 }
 
 // resolveItem assembles a FetchedItem for a single feed entry, resolving the
@@ -303,18 +352,27 @@ func (c *Connector) resolveItem(
 
 	// Prefer full article text; fall back to feed-provided content on failure.
 	contentHTML := feedContent
+	plainText := feed.FeedType == "json" && item.Custom["content_type"] == "text/plain"
+	articleFailed := false
 	if strings.TrimSpace(item.Link) != "" {
 		if articleHTML, articleTitle, err := cli.extractArticle(ctx, item.Link); err == nil {
 			contentHTML = articleHTML
+			plainText = false
 			if item.Title == "" && articleTitle != "" {
 				title = articleTitle
 			}
 		} else {
+			articleFailed = true
 			logger.Warnf(ctx, "[RSS] full-text fetch failed for %s (using feed content): %v", item.Link, err)
 		}
 	}
 
-	content := htmlToMarkdown(contentHTML)
+	var content string
+	if plainText {
+		content = plainTextToMarkdown(contentHTML)
+	} else {
+		content = htmlToMarkdown(contentHTML)
+	}
 
 	updatedAt := time.Now().UTC()
 	switch {
@@ -330,7 +388,8 @@ func (c *Connector) resolveItem(
 	}
 
 	return resolvedFeedItem{
-		fingerprint: contentFingerprint(content),
+		fingerprint:   itemFingerprint(title, item.Link, content),
+		articleFailed: articleFailed,
 		item: types.FetchedItem{
 			ExternalID:       itemExternalID(feedURL, itemID),
 			Title:            title,

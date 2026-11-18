@@ -10,7 +10,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -32,6 +31,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
@@ -141,8 +141,8 @@ func holdbackCutoff(chunk string) int {
 }
 
 // formatIMOutboundAnswer strips thinking/tool blocks and applies IM content cleanup.
-func formatIMOutboundAnswer(ctx context.Context, raw string, tenant *types.Tenant, defaultFileSvc interfaces.FileService, storageResolvers ...interfaces.StorageBackendResolver) string {
-	return cleanIMContent(ctx, FormatIMDisplayContent(raw, StreamDisplayFinal), tenant, defaultFileSvc, storageResolvers...)
+func formatIMOutboundAnswer(ctx context.Context, raw string, resolver *storageurl.FileServiceResolver) string {
+	return cleanIMContent(ctx, FormatIMDisplayContent(raw, StreamDisplayFinal), resolver)
 }
 
 // formatIMOutboundAnswerOrFallback guarantees that cleanup cannot turn a
@@ -152,11 +152,9 @@ func formatIMOutboundAnswer(ctx context.Context, raw string, tenant *types.Tenan
 func formatIMOutboundAnswerOrFallback(
 	ctx context.Context,
 	raw string,
-	tenant *types.Tenant,
-	defaultFileSvc interfaces.FileService,
-	storageResolvers ...interfaces.StorageBackendResolver,
+	resolver *storageurl.FileServiceResolver,
 ) string {
-	content := formatIMOutboundAnswer(ctx, raw, tenant, defaultFileSvc, storageResolvers...)
+	content := formatIMOutboundAnswer(ctx, raw, resolver)
 	if strings.TrimSpace(content) == "" {
 		return imNoAnswerFallback
 	}
@@ -184,11 +182,13 @@ func imQAFailureReply(err error) string {
 // cleanIMContent applies all IM-specific content transformations:
 //  1. Collapse <image> XML blocks back to plain markdown
 //  2. Strip <kb/> and <web/> citation tags
-//  3. Rewrite provider:// URLs to HTTP URLs (scheme-aware per tenant config)
-func cleanIMContent(ctx context.Context, content string, tenant *types.Tenant, defaultFileSvc interfaces.FileService, storageResolvers ...interfaces.StorageBackendResolver) string {
+//  3. Rewrite storage references to HTTP URLs using their owning storage instance
+func cleanIMContent(ctx context.Context, content string, resolver *storageurl.FileServiceResolver) string {
 	content = stripImageXMLTags(content)
 	content = stripIMCitationTags(content)
-	resolver := newIMFileServiceResolver(tenant, defaultFileSvc, storageResolvers...).WithContext(ctx)
+	if resolver != nil {
+		resolver.WithContext(ctx)
+	}
 	content = rewriteStorageURLs(ctx, content, resolver)
 	return content
 }
@@ -202,6 +202,21 @@ func newIMFileServiceResolver(
 	storageResolvers ...interfaces.StorageBackendResolver,
 ) *storageurl.FileServiceResolver {
 	return storageurl.NewFileServiceResolver(tenant, defaultSvc, storageResolvers...)
+}
+
+// Every platform and output mode uses the same resource-aware resolver. Keep
+// it scoped to the reply so shared KB images select their owner's backend and
+// multiple images on the same instance reuse its client during streaming.
+func (s *Service) newOutboundFileServiceResolver(
+	tenant *types.Tenant,
+	agent *types.CustomAgent,
+	kbIDs []string,
+) *storageurl.FileServiceResolver {
+	return newIMFileServiceResolver(tenant, s.defaultFileSvc, s.storageResolver).
+		WithResources(s.resourceCatalog, s.tenantService).
+		WithAuthorization(func(ctx context.Context, reference string) error {
+			return s.authorizeOutboundResource(ctx, tenant, agent, kbIDs, reference)
+		})
 }
 
 func buildIMFileServiceForProvider(
@@ -298,7 +313,8 @@ type Service struct {
 	knowledgeService interfaces.KnowledgeService
 
 	// kbService is used by slash-commands (/info) to list and inspect knowledge bases.
-	kbService interfaces.KnowledgeBaseService
+	kbService      interfaces.KnowledgeBaseService
+	kbShareService interfaces.KBShareService
 
 	// oauthManager builds MCP OAuth authorization URLs so IM users can authorize
 	// OAuth-enabled MCP services out-of-band (IM cannot resolve the in-conversation
@@ -315,6 +331,7 @@ type Service struct {
 	defaultFileSvc  interfaces.FileService
 	documentReader  interfaces.DocumentReader
 	storageResolver interfaces.StorageBackendResolver
+	resourceCatalog interfaces.ResourceCatalog
 
 	// cmdRegistry holds all registered slash-commands.
 	cmdRegistry *CommandRegistry
@@ -417,13 +434,22 @@ func formatQuotedContext(quote *QuotedMessage) string {
 // user (recognised by types.IsSyntheticUserID) lets Organization-shared
 // knowledge bases be merged and resolved correctly, since the shared-KB code
 // gates on a non-empty UserID. Viewer is the least privilege sufficient to
-// retrieve shared KBs.
-func withIMIdentity(ctx context.Context, tenantID uint64, channelID string, msg *IncomingMessage) context.Context {
+// retrieve shared KBs. The channel locale replaces any HTTP middleware value
+// because webhook Accept-Language belongs to the IM platform, not the writer;
+// channels without an explicit locale use the deployment default.
+func withIMIdentity(ctx context.Context, channel *IMChannel, msg *IncomingMessage) context.Context {
+	tenantID := channel.TenantID
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
 	ctx = context.WithValue(ctx, types.UserIDContextKey, fmt.Sprintf("system-%d", tenantID))
+	locale := channel.Locale
+	if locale == "" {
+		locale = types.DefaultLanguage()
+	}
+	ctx = context.WithValue(ctx, types.LanguageContextKey, locale)
 	if msg != nil {
-		principalID := fmt.Sprintf("%d:%s:%s:%s", tenantID, channelID, msg.Platform, msg.UserID)
+		principalID := fmt.Sprintf("%d:%s:%s:%s", tenantID, channel.ID, msg.Platform, msg.UserID)
 		ctx = types.WithPrincipal(ctx, types.Principal{Type: types.PrincipalIMUser, ID: principalID})
+		ctx = types.WithPrincipalAuthSource(ctx, types.AuthSourceIM)
 	}
 	ctx = context.WithValue(ctx, types.TenantRoleContextKey, types.TenantRoleViewer)
 	// IM bots have no live client that can complete an in-conversation MCP OAuth
@@ -849,6 +875,8 @@ func NewService(
 	redisClient *redis.Client,
 	appCfg *config.Config,
 	storageResolver interfaces.StorageBackendResolver,
+	resourceCatalog interfaces.ResourceCatalog,
+	kbShareService interfaces.KBShareService,
 ) *Service {
 	// Resolve IM configuration with defaults.
 	workers, maxQueue, maxPerUser, globalMaxWorkers, rlWindow, rlMax := resolveIMConfig(appCfg)
@@ -874,6 +902,8 @@ func NewService(
 		defaultFileSvc:   defaultFileSvc,
 		documentReader:   documentReader,
 		storageResolver:  storageResolver,
+		resourceCatalog:  resourceCatalog,
+		kbShareService:   kbShareService,
 		oauthManager:     oauthManager,
 		cmdRegistry:      registry,
 		channels:         make(map[string]*channelState),
@@ -1606,6 +1636,7 @@ func sameChannelRuntimeConfig(cached, fresh *IMChannel) bool {
 		cached.Enabled == fresh.Enabled &&
 		cached.Mode == fresh.Mode &&
 		cached.OutputMode == fresh.OutputMode &&
+		cached.Locale == fresh.Locale &&
 		cached.KnowledgeBaseID == fresh.KnowledgeBaseID &&
 		cached.SessionMode == fresh.SessionMode &&
 		equalChannelCredentials(cached.Credentials, fresh.Credentials)
@@ -1763,7 +1794,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		return fmt.Errorf("get tenant: %w", err)
 	}
 	sessionCtx := context.WithValue(ctx, types.TenantInfoContextKey, tenant)
-	sessionCtx = withIMIdentity(sessionCtx, tenantID, channelID, msg)
+	sessionCtx = withIMIdentity(sessionCtx, channel, msg)
 
 	// 2. Resolve or create a WeKnora session
 	channelSession, err := s.resolveSession(sessionCtx, msg, tenantID, agentID, channelID, channel.SessionMode)
@@ -1995,7 +2026,8 @@ func (s *Service) executeQARequest(req *qaRequest) {
 
 	outCtx := imOutboundContext(ctx)
 	reply := &ReplyMessage{
-		Content: formatIMOutboundAnswerOrFallback(outCtx, answer, req.tenant, s.defaultFileSvc, s.storageResolver),
+		Content: formatIMOutboundAnswerOrFallback(outCtx, answer,
+			s.newOutboundFileServiceResolver(req.tenant, req.agent, kbIDs)),
 		IsFinal: true,
 	}
 	if err := req.adapter.SendReply(outCtx, req.msg, reply); err != nil {
@@ -2043,7 +2075,8 @@ func (s *Service) handleMessageFullOutput(
 	// QA (and /stop) may have cancelled ctx. Platform updates must still run so
 	// the thinking card is replaced instead of hanging forever.
 	outCtx := imOutboundContext(ctx)
-	finalContent := formatIMOutboundAnswerOrFallback(outCtx, answer, tenant, s.defaultFileSvc, s.storageResolver)
+	finalContent := formatIMOutboundAnswerOrFallback(outCtx, answer,
+		s.newOutboundFileServiceResolver(tenant, customAgent, kbIDs))
 
 	finalizeErr := streamer.FinalizeStream(outCtx, msg, streamID, finalContent)
 	if finalizeErr != nil {
@@ -2285,7 +2318,7 @@ func imInitialSessionTitle(msg *IncomingMessage, identityTitle func(*IncomingMes
 }
 
 // resolveUserSession finds or creates a ChannelSession keyed by (platform, user_id, chat_id, tenant_id, agent_id).
-// This is the original session resolution strategy.
+// Only mappings with an empty thread_id belong to user mode.
 //
 // Invariant: a cache miss creates a brand-new session — we never attach a second
 // mapping to an existing session. The session-list source filter (repository
@@ -2293,7 +2326,9 @@ func imInitialSessionTitle(msg *IncomingMessage, identityTitle func(*IncomingMes
 // re-maps an existing session, that JOIN needs a one-row-per-session guard.
 func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string) (*ChannelSession, error) {
 	var cs ChannelSession
-	result := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+	result := s.db.Where(
+		"platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? "+
+			"AND agent_id = ? AND thread_id = '' AND deleted_at IS NULL",
 		string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
 		First(&cs)
 
@@ -2337,7 +2372,9 @@ func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, 
 			logger.Warnf(ctx, "[IM] Failed to clean up orphaned session %s: %v", createdSession.ID, delErr)
 		}
 		var existing ChannelSession
-		if findErr := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND agent_id = ? AND deleted_at IS NULL",
+		if findErr := s.db.Where(
+			"platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? "+
+				"AND agent_id = ? AND thread_id = '' AND deleted_at IS NULL",
 			string(msg.Platform), msg.UserID, msg.ChatID, tenantID, agentID).
 			First(&existing).Error; findErr != nil {
 			return nil, fmt.Errorf("create channel session: %w (lookup fallback: %v)", err, findErr)
@@ -2819,6 +2856,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	// XML tags that straddle a chunk boundary (see holdbackCutoff).
 	ticker := time.NewTicker(streamFlushInterval)
 	defer ticker.Stop()
+	fileResolver := s.newOutboundFileServiceResolver(tenant, customAgent, kbIDs)
 
 	flush := func() {
 		bufMu.Lock()
@@ -2835,7 +2873,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 			displaySource = displaySource[:cut]
 		}
 
-		display := cleanIMContent(ctx, displaySource, tenant, s.defaultFileSvc, s.storageResolver)
+		display := cleanIMContent(ctx, displaySource, fileResolver)
 		if err := streamer.UpdateStreamContent(ctx, msg, streamID, display); err != nil {
 			logger.Warnf(ctx, "[IM] UpdateStreamContent failed: %v", err)
 		}
@@ -2875,7 +2913,7 @@ loop:
 	bufMu.Unlock()
 
 	outCtx := imOutboundContext(ctx)
-	finalDisplay := cleanIMContent(outCtx, FormatIMFinalFromParts(parts), tenant, s.defaultFileSvc, s.storageResolver)
+	finalDisplay := cleanIMContent(outCtx, FormatIMFinalFromParts(parts), fileResolver)
 	if noVisibleContent || finalDisplay == "" {
 		fallback := imNoAnswerFallback
 		if finalErr != nil {
@@ -2939,7 +2977,8 @@ func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, s
 
 	outCtx := imOutboundContext(ctx)
 	return adapter.SendReply(outCtx, msg, &ReplyMessage{
-		Content: formatIMOutboundAnswerOrFallback(outCtx, answer, tenant, s.defaultFileSvc, s.storageResolver),
+		Content: formatIMOutboundAnswerOrFallback(outCtx, answer,
+			s.newOutboundFileServiceResolver(tenant, customAgent, kbIDs)),
 		IsFinal: true,
 	})
 }
@@ -3167,6 +3206,7 @@ type ChannelWithAgent struct {
 	Enabled     bool      `json:"enabled"`
 	Mode        string    `json:"mode"`
 	OutputMode  string    `json:"output_mode"`
+	Locale      string    `json:"locale"`
 	SessionMode string    `json:"session_mode"`
 	BotIdentity string    `json:"bot_identity"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -3184,7 +3224,7 @@ func (s *Service) ListChannelsByTenant(ctx context.Context, tenantID uint64) ([]
 	q := s.db.Table("im_channels AS c").
 		Select(`c.id, c.tenant_id, c.agent_id,
                 COALESCE(a.name, '') AS agent_name,
-                c.platform, c.name, c.enabled, c.mode, c.output_mode,
+                c.platform, c.name, c.enabled, c.mode, c.output_mode, c.locale,
                 c.session_mode, c.bot_identity, c.created_at, c.updated_at`).
 		Joins(`LEFT JOIN custom_agents AS a
                ON a.id = c.agent_id AND a.tenant_id = c.tenant_id AND a.deleted_at IS NULL`).
@@ -3387,15 +3427,6 @@ func (s *Service) checkDuplicateBot(channel *IMChannel, excludeID string) error 
 // at the start and end of processing.
 // ────────────────────────────────────────────────────────────────────────
 
-// supportedKBFileExts is the set of file extensions that can be saved to a knowledge base.
-var supportedKBFileExts = map[string]bool{
-	"pdf": true, "txt": true, "docx": true, "doc": true,
-	"md": true, "markdown": true,
-	"png": true, "jpg": true, "jpeg": true, "gif": true,
-	"csv": true, "xlsx": true, "xls": true,
-	"pptx": true, "ppt": true,
-}
-
 // fileMessageQAContent turns a file-only platform event into a valid QA query.
 // IM adapters intentionally leave Content empty for file/image messages, while
 // the QA API requires a non-empty query. Preserve a caption when an adapter
@@ -3430,7 +3461,8 @@ func (s *Service) processDownloadedFileToKnowledgeBase(ctx context.Context, chan
 
 	fileName := file.fileName
 	ext := fileExtension(fileName)
-	if !supportedKBFileExts[ext] {
+	// Share the upload policy so IM does not silently discard supported formats.
+	if !utils.IsSupportedImportExtension(ext) {
 		logger.Infof(ctx, "[IM] Unsupported file type after download: %s (file=%s)", ext, fileName)
 		return
 	}
@@ -3487,11 +3519,10 @@ func newInMemoryFileHeader(filename string, data []byte) *multipart.FileHeader {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
-	h := make(textproto.MIMEHeader)
-	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
-	h.Set("Content-Type", "application/octet-stream")
-
-	part, err := writer.CreatePart(h)
+	// CreateFormFile escapes the filename for Content-Disposition. Building
+	// the header by string concatenation left quotes unescaped, so an
+	// attachment such as `Q4 "Final".md` parsed back as an unreadable header.
+	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
 		// Fallback: return a minimal FileHeader
 		return &multipart.FileHeader{Filename: filename, Size: int64(len(data))}

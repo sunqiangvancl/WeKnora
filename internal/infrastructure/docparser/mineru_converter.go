@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -22,7 +21,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/utils"
 )
 
-const mineruTimeout = 1000 * time.Second // large docs can take a while
+// defaultMinerUTimeout bounds one self-hosted parse; WEKNORA_MINERU_TIMEOUT
+// overrides it for documents that take longer.
+const defaultMinerUTimeout = 1000 * time.Second // large docs can take a while
 
 var (
 	b64DataURIPattern     = regexp.MustCompile(`^data:image/(\w+);base64,(.+)$`)
@@ -30,14 +31,23 @@ var (
 )
 
 // MinerUReader calls a self-hosted MinerU API to read/convert documents.
+// MinerU 4.0.x uses V1 Jobs, 4.1 uses V1 Tasks, and older servers use the
+// legacy /file_parse endpoint. The protocol is detected per request, so an
+// in-place MinerU upgrade needs no configuration change.
 type MinerUReader struct {
-	endpoint      string
+	endpoint string
+	timeout  time.Duration
+	apiKey   string // server --api-key (V1), or the gateway key when a legacy endpoint sits behind auth
+	tier     string // V1 only: flash, basic, standard, advanced; "" = server default
+	// Legacy (<= 3.x) only; MinerU 4.0 dropped these request parameters.
 	backend       string // "pipeline", "vlm-*", "hybrid-*"
+	effort        string // legacy hybrid: medium or high; "" = server default
 	vlmServerURL  string // vLLM server URL for vlm-http-client / hybrid-http-client
 	formulaEnable bool
 	tableEnable   bool
-	parseMethod   string
 	language      string
+	// Shared: legacy parse_method / V1 ocr_mode take the same values.
+	parseMethod string
 }
 
 // NewMinerUReader creates a reader from ParserEngineOverrides.
@@ -50,7 +60,11 @@ func NewMinerUReader(overrides map[string]string) *MinerUReader {
 
 	c := &MinerUReader{
 		endpoint:      strings.TrimRight(overrides["mineru_endpoint"], "/"),
+		timeout:       requestTimeoutFromEnv("WEKNORA_MINERU_TIMEOUT", defaultMinerUTimeout),
+		apiKey:        strings.TrimSpace(overrides["mineru_server_api_key"]),
+		tier:          resolveMinerUTier(overrides["mineru_tier"]),
 		backend:       stringOr(overrides["mineru_model"], "pipeline"),
+		effort:        resolveMinerUEffort(overrides["mineru_effort"]),
 		vlmServerURL:  overrides["mineru_vlm_server_url"],
 		formulaEnable: parseBoolOr(overrides["mineru_enable_formula"], true),
 		tableEnable:   parseBoolOr(overrides["mineru_enable_table"], true),
@@ -58,6 +72,25 @@ func NewMinerUReader(overrides map[string]string) *MinerUReader {
 		language:      stringOr(overrides["mineru_language"], "ch"),
 	}
 	return c
+}
+
+// resolveMinerUTier keeps only tiers MinerU 4.0 understands; anything else
+// falls back to the server's default selection.
+func resolveMinerUTier(raw string) string {
+	tier := strings.ToLower(strings.TrimSpace(raw))
+	if _, ok := mineruV1Tiers[tier]; ok {
+		return tier
+	}
+	return ""
+}
+
+func resolveMinerUEffort(raw string) string {
+	switch effort := strings.ToLower(strings.TrimSpace(raw)); effort {
+	case "medium", "high":
+		return effort
+	default:
+		return ""
+	}
 }
 
 func (c *MinerUReader) Read(ctx context.Context, req *types.ReadRequest) (*types.ReadResult, error) {
@@ -78,9 +111,23 @@ func (c *MinerUReader) Read(ctx context.Context, req *types.ReadRequest) (*types
 		return &types.ReadResult{Error: "no file content provided"}, nil
 	}
 
-	logger.Infof(context.Background(), "[MinerU] Parsing file=%s size=%d via %s", req.FileName, len(content), c.endpoint)
+	protocol, err := detectMinerUProtocol(ctx, utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{
+		Timeout:      mineruV1APITimeout,
+		MaxRedirects: 5,
+	}), c.endpoint, c.apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("MinerU protocol detection: %w", err)
+	}
 
-	mdContent, imagesB64, err := c.callFileParse(ctx, content, req.FileName, req.FileType)
+	if protocol != minerUProtocolLegacy {
+		logger.Infof(ctx, "[MinerU] Parsing file=%s size=%d via %s (V1 API)", req.FileName, len(content), c.endpoint)
+		return c.readV1(ctx, req, protocol)
+	}
+
+	logger.Infof(ctx, "[MinerU] Parsing file=%s size=%d via %s (legacy /file_parse)",
+		req.FileName, len(content), c.endpoint)
+
+	mdContent, imagesB64, contentList, err := c.callFileParse(ctx, content, req.FileName, req.FileType)
 	if err != nil {
 		return nil, fmt.Errorf("MinerU file_parse: %w", err)
 	}
@@ -100,12 +147,43 @@ func (c *MinerUReader) Read(ctx context.Context, req *types.ReadRequest) (*types
 	return &types.ReadResult{
 		MarkdownContent: mdContent,
 		ImageRefs:       imageRefs,
+		SourceBlocks:    minerUSourceBlocks(mdContent, contentList, req.FileType),
+	}, nil
+}
+
+func (c *MinerUReader) readV1(
+	ctx context.Context, req *types.ReadRequest, protocol minerUProtocol,
+) (*types.ReadResult, error) {
+	client := newMinerUV1Client(c.endpoint, c.apiKey, c.timeout)
+	parse := client.ParseWithLayout
+	if protocol == minerUProtocolTasks {
+		parse = (&minerUTasksClient{client}).ParseWithLayout
+	}
+	mdContent, imageRefs, contentList, err := parse(ctx, req.FileContent,
+		minerUUploadFileName(req.FileName, req.FileType),
+		minerUV1ParseOptions{Tier: c.tier, OCRMode: c.parseMethod})
+	if err != nil {
+		return nil, fmt.Errorf("MinerU V1: %w", err)
+	}
+
+	mdContent = normalizeMinerUMarkdown(mdContent)
+	mdContent, imageRefs = ensureOriginalImageRef(req, mdContent, imageRefs)
+
+	logger.Infof(ctx, "[MinerU] Parsed successfully (V1), markdown=%d chars, images=%d", len(mdContent), len(imageRefs))
+
+	return &types.ReadResult{
+		MarkdownContent: mdContent,
+		ImageRefs:       imageRefs,
+		SourceBlocks:    minerUSourceBlocks(mdContent, contentList, req.FileType),
 	}, nil
 }
 
 type mineruFileEntry struct {
 	MDContent string            `json:"md_content"`
 	Images    map[string]string `json:"images"` // path -> "data:image/png;base64,..." or raw base64
+	// ContentList is the layout block list (page and box per block), as a
+	// JSON array or a string holding one depending on the MinerU version.
+	ContentList json.RawMessage `json:"content_list"`
 }
 
 func minerUCleanFileType(fileType string) string {
@@ -187,12 +265,24 @@ func parseMinerUFileParseResponse(respBody []byte, uploadFileName string) (strin
 	return "", nil, "", nil
 }
 
+// minerUFileParseContentList returns the content_list of the result entry
+// that supplied the markdown.
+func minerUFileParseContentList(respBody []byte, resultKey string) json.RawMessage {
+	var envelope struct {
+		Results map[string]mineruFileEntry `json:"results"`
+	}
+	if json.Unmarshal(respBody, &envelope) != nil {
+		return nil
+	}
+	return envelope.Results[resultKey].ContentList
+}
+
 func (c *MinerUReader) callFileParse(
 	ctx context.Context,
 	content []byte,
 	fileName string,
 	fileType string,
-) (string, map[string]string, error) {
+) (string, map[string]string, json.RawMessage, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
@@ -214,6 +304,9 @@ func (c *MinerUReader) callFileParse(
 	if c.language != "" {
 		fields["lang_list"] = c.language
 	}
+	if c.effort != "" && strings.HasPrefix(c.backend, "hybrid-") {
+		fields["effort"] = c.effort
+	}
 	if c.vlmServerURL != "" && (strings.HasPrefix(c.backend, "vlm-http-client") || strings.HasPrefix(c.backend, "hybrid-http-client")) {
 		fields["server_url"] = c.vlmServerURL
 	}
@@ -226,43 +319,54 @@ func (c *MinerUReader) callFileParse(
 	// File part
 	part, err := writer.CreateFormFile("files", uploadFileName)
 	if err != nil {
-		return "", nil, fmt.Errorf("create form file: %w", err)
+		return "", nil, nil, fmt.Errorf("create form file: %w", err)
 	}
 	if _, err := part.Write(content); err != nil {
-		return "", nil, fmt.Errorf("write file content: %w", err)
+		return "", nil, nil, fmt.Errorf("write file content: %w", err)
 	}
 	writer.Close()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/file_parse", &body)
 	if err != nil {
-		return "", nil, fmt.Errorf("create request: %w", err)
+		return "", nil, nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+	// Legacy MinerU servers (<= 3.x) do not require an API key themselves, but
+	// deployments commonly sit behind an authenticating gateway (NewAPI/OneAPI
+	// etc.). When a key is configured, attach it so the request survives the
+	// gateway, matching the V1 path's behaviour.
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	client := utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{
-		Timeout:      mineruTimeout,
+		Timeout:      c.timeout,
 		MaxRedirects: 5,
 	})
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return "", nil, fmt.Errorf("HTTP request: %w", err)
+		return "", nil, nil, fmt.Errorf("HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("MinerU API status %d: %s", resp.StatusCode, string(respBody))
+		preview := readErrorPreview(resp.Body)
+		return "", nil, nil, fmt.Errorf("MinerU API status %d: %s", resp.StatusCode, preview)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readCapped(resp.Body, maxResultResponseBytes)
 	if err != nil {
-		return "", nil, fmt.Errorf("read response body: %w", err)
+		return "", nil, nil, fmt.Errorf("read response body: %w", err)
 	}
 
 	// Dump raw response for debugging (truncate if too large)
 	rawStr := string(respBody)
-	if len(rawStr) > 4000 {
-		logger.Infof(context.Background(), "[MinerU] Raw response (truncated to 4000 chars): %s ...", rawStr[:4000])
+	if len(rawStr) > rawResponseLogBytes {
+		logger.Infof(
+			context.Background(),
+			"[MinerU] Raw response (truncated to %d chars): %s",
+			rawResponseLogBytes, rawResponsePreview(rawStr),
+		)
 	} else {
 		logger.Infof(context.Background(), "[MinerU] Raw response: %s", rawStr)
 	}
@@ -275,15 +379,15 @@ func (c *MinerUReader) callFileParse(
 
 	mdContent, imagesB64, resultKey, err := parseMinerUFileParseResponse(respBody, uploadFileName)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	if resultKey != "" {
 		logger.Infof(context.Background(), "[MinerU] Using response path: results.%s", resultKey)
-		return mdContent, imagesB64, nil
+		return mdContent, imagesB64, minerUFileParseContentList(respBody, resultKey), nil
 	}
 
 	logger.Errorf(context.Background(), "[MinerU] Response has no markdown/images under results")
-	return "", nil, nil
+	return "", nil, nil, nil
 }
 
 // processImages decodes base64 images from MinerU response and returns ImageRef list.
@@ -358,8 +462,10 @@ func validateMinerUOutboundURL(rawURL string) error {
 	return nil
 }
 
-// PingMinerU checks if the self-hosted MinerU service is reachable.
-func PingMinerU(endpoint string) (bool, string) {
+// PingMinerU checks if the self-hosted MinerU service is reachable. For V1
+// it also probes an authenticated route (Jobs list in 4.0, usage in 4.1), since
+// /v1/health itself is public unless behind an authenticating gateway.
+func PingMinerU(endpoint, apiKey string) (bool, string) {
 	endpoint = strings.TrimRight(endpoint, "/")
 	if endpoint == "" {
 		return false, "未配置 MinerU 端点"
@@ -371,13 +477,73 @@ func PingMinerU(endpoint string) (bool, string) {
 		Timeout:      5 * time.Second,
 		MaxRedirects: 5,
 	})
-	resp, err := client.Get(endpoint + "/docs")
+	ctx := context.Background()
+
+	protocol, err := detectMinerUProtocol(ctx, client, endpoint, apiKey)
+	if err != nil {
+		return false, fmt.Sprintf("MinerU 服务不可用: %v", err)
+	}
+	if protocol == minerUProtocolV1 {
+		return pingMinerUV1Auth(ctx, client, endpoint, apiKey)
+	}
+	if protocol == minerUProtocolTasks {
+		// Health, models and tiers are public in 4.1; usage is a read-only
+		// authenticated route. GET /v1/tasks is not a listing/auth probe.
+		return pingMinerUAuth(ctx, client, endpoint+"/v1/usage", apiKey)
+	}
+
+	resp, err := pingMinerULegacy(ctx, client, endpoint, apiKey)
 	if err != nil {
 		return false, fmt.Sprintf("MinerU 服务不可达: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return false, fmt.Sprintf("MinerU 服务返回状态 %d", resp.StatusCode)
+	}
+	return true, ""
+}
+
+// pingMinerULegacy probes a legacy MinerU server's /docs endpoint. Like the
+// V1 probe, it attaches the configured API key so a server sitting behind an
+// authenticating gateway is still reachable.
+func pingMinerULegacy(ctx context.Context, client *http.Client, endpoint, apiKey string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/docs", nil)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %v", err)
+	}
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return client.Do(req)
+}
+
+// pingMinerUV1Auth hits an authenticated V1 endpoint: a server started with
+// --api-key answers 401 when the key is missing or wrong.
+func pingMinerUV1Auth(ctx context.Context, client *http.Client, endpoint, apiKey string) (bool, string) {
+	return pingMinerUAuth(ctx, client, endpoint+"/v1/parse/jobs?limit=1", apiKey)
+}
+
+func pingMinerUAuth(ctx context.Context, client *http.Client, probeURL, apiKey string) (bool, string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false, fmt.Sprintf("构建请求失败: %v", err)
+	}
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("MinerU 服务不可达: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		if apiKey == "" {
+			return false, "MinerU 服务已启用鉴权，请配置 API Key"
+		}
+		return false, "MinerU API Key 无效"
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("MinerU 鉴权检查返回状态 %d，无法验证 API Key", resp.StatusCode)
 	}
 	return true, ""
 }

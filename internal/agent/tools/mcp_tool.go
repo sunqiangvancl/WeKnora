@@ -1,15 +1,22 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/approval"
+	"github.com/Tencent/WeKnora/internal/agent/hitl"
+	"github.com/Tencent/WeKnora/internal/agent/policy"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -17,6 +24,21 @@ import (
 )
 
 type MCPInput = map[string]any
+
+// decodeMCPInput retains JSON numbers until the transport serializes them.
+// Decoding through float64 would change large IDs and precise decimal values
+// after schema validation or human approval.
+func decodeMCPInput(args json.RawMessage) (MCPInput, error) {
+	value, err := jsonschema.UnmarshalJSON(bytes.NewReader(args))
+	if err != nil {
+		return nil, err
+	}
+	input, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("MCP arguments must be an object")
+	}
+	return input, nil
+}
 
 // MCPTool wraps an MCP service tool to implement the Tool interface
 type MCPTool struct {
@@ -33,6 +55,15 @@ type MCPTool struct {
 	schemaErr              error
 	registeredName         string
 	serverInstructions     string
+	// serverVersion is the server version saved with the directory this tool
+	// came from; empty when the server reported none or it was not recorded.
+	serverVersion string
+	// savedAt is when that directory was listed; zero when unknown.
+	savedAt time.Time
+	// revalidate re-lists the saved directory this tool came from and, when it
+	// waited for the re-list, returns the server's current tools. It is nil for
+	// tools that were not loaded through a revalidating catalog.
+	revalidate func(ctx context.Context, reason string, wait bool) ([]*types.MCPTool, bool)
 }
 
 // NewMCPTool creates a new MCP tool wrapper. authWaitTimeoutSeconds carries the
@@ -156,20 +187,44 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 	}
 
 	// Parse args from json.RawMessage
-	var input MCPInput
-	if err := json.Unmarshal(args, &input); err != nil {
+	input, err := decodeMCPInput(args)
+	if err != nil {
 		logger.Errorf(ctx, "[Tool][MCPTool] Failed to parse args: %v", err)
 		return &types.ToolResult{
 			Success: false,
 			Error:   fmt.Sprintf("Failed to parse args: %v", err),
 		}, err
 	}
+	if result, err := checkMCPCallGuard(ctx, t.service.ID, t.mcpTool.Name, args); result != nil || err != nil {
+		return result, err
+	}
+
+	// The post-approval ctx is derived from ApprovalCtx, which does not carry
+	// the exec metadata; read it once here so the OAuth prompt still works
+	// for tools that require approval.
+	execMeta, _ := ToolExecFromContext(ctx)
+	callWindowDerived := false
 
 	// Human approval gate for dangerous tools (issue #1173)
 	if t.gate != nil {
-		if meta, ok := ToolExecFromContext(ctx); ok && meta != nil && meta.EventBus != nil {
-			tenantID, _ := types.TenantIDFromContext(ctx)
-			if t.gate.NeedsApproval(ctx, tenantID, t.service.ID, t.mcpTool.Name) {
+		tenantID, _ := types.TenantIDFromContext(ctx)
+		action := t.gate.Action(ctx, tenantID, t.service.ID, t.mcpTool)
+		rules := policy.Rules{Level: types.AccessLevelFromContext(ctx)}
+		verdict := policy.Decide(action, rules)
+		policy.Record(ctx, "mcp:"+t.service.Name+"/"+t.mcpTool.Name, action, rules, verdict)
+		if verdict == policy.Deny {
+			return &types.ToolResult{
+				Success: false,
+				Error: "this tool changes data, which this conversation's read-only access does not allow. " +
+					"Tell the user; do not retry.",
+			}, nil
+		}
+		if meta := execMeta; meta != nil && meta.EventBus != nil {
+			// A resumed call already holds the user's decision. It is honored
+			// even if the tool stopped requiring approval meanwhile, since the
+			// user may have edited the arguments.
+			resumed := meta.Answered != nil && meta.Answered.Kind == types.AgentPromptKindToolApproval
+			if resumed || verdict == policy.Ask {
 				// Use ApprovalCtx (round-level ctx WITHOUT defaultToolExecTimeout) so
 				// human approval can legitimately wait longer than the per-tool 60s.
 				// User-stop / request cancel still propagates because ApprovalCtx is a
@@ -178,25 +233,59 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 				if meta.ApprovalCtx != nil {
 					waitCtx = meta.ApprovalCtx
 				}
-				decision, waitErr := t.gate.RequestAndWait(waitCtx, approval.PendingRequest{
-					TenantID:           tenantID,
-					UserID:             meta.UserID,
-					SessionID:          meta.SessionID,
-					AssistantMessageID: meta.AssistantMessageID,
-					RequestID:          meta.RequestID,
-					EventBus:           meta.EventBus,
-					ServiceID:          t.service.ID,
-					ServiceName:        t.service.Name,
-					MCPToolName:        t.mcpTool.Name,
-					RegisteredToolName: t.Name(),
-					Description:        t.mcpTool.Description,
-					Args:               args,
-					ToolCallID:         meta.ToolCallID,
-				})
+				var decision approval.Decision
+				var waitErr error
+				if resumed {
+					decision = t.gate.ResumeDecision(waitCtx, meta.Answered, meta.EventBus)
+				} else {
+					var grant, grantScope string
+					if policy.Pregrantable(action) {
+						grant, grantScope = t.approvalGrant(ctx)
+					}
+					var snapshot []byte
+					var snapshotVersion int
+					if meta.Snapshot != nil {
+						var snapErr error
+						if snapshot, snapshotVersion, snapErr = meta.Snapshot(); snapErr != nil {
+							// Without run state the approval can still block in memory.
+							logger.Warnf(ctx, "[Tool][MCPTool] capture run state for approval: %v", snapErr)
+							snapshot = nil
+						}
+					}
+					decision, waitErr = t.gate.RequestAndWait(waitCtx, approval.PendingRequest{
+						Snapshot:        snapshot,
+						SnapshotVersion: snapshotVersion,
+						// The user answers from their own workspace, which differs
+						// from tenantID (the agent's) when the agent is shared.
+						TenantID:           types.CallerFromContext(ctx).TenantID,
+						UserID:             meta.UserID,
+						SessionID:          meta.SessionID,
+						AssistantMessageID: meta.AssistantMessageID,
+						RequestID:          meta.RequestID,
+						EventBus:           meta.EventBus,
+						ServiceID:          t.service.ID,
+						ServiceName:        t.service.Name,
+						MCPToolName:        t.mcpTool.Name,
+						RegisteredToolName: t.Name(),
+						Description:        t.mcpTool.Description,
+						Args:               args,
+						ToolCallID:         meta.ToolCallID,
+						Grant:              grant,
+						GrantScope:         grantScope,
+						GrantRisk:          action.Risk,
+					})
+				}
 				if waitErr != nil {
 					return &types.ToolResult{
 						Success: false,
 						Error:   fmt.Sprintf("Tool approval failed: %v", waitErr),
+					}, nil
+				}
+				if decision.Suspended != nil {
+					return &types.ToolResult{
+						Success: false,
+						Error:   "waiting for the user to approve this tool call",
+						Suspend: decision.Suspended,
 					}, nil
 				}
 				if !decision.Approved {
@@ -209,6 +298,7 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 						Error:   msg,
 					}, nil
 				}
+				defer t.gate.MarkExecuted(ctx, decision.PendingID)
 				if len(decision.ModifiedArgs) > 0 {
 					args = decision.ModifiedArgs
 					if err := t.ValidateArguments(args); err != nil {
@@ -218,8 +308,8 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 						}, nil
 					}
 					// Approved replacements must not retain keys from the old object.
-					input = nil
-					if err := json.Unmarshal(args, &input); err != nil {
+					input, err = decodeMCPInput(args)
+					if err != nil {
 						return &types.ToolResult{
 							Success: false,
 							Error:   fmt.Sprintf("Invalid modified_args after approval: %v", err),
@@ -234,13 +324,14 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 					freshCtx, freshCancel := context.WithTimeout(meta.ApprovalCtx, t.callToolTimeout(meta.ExecTimeout))
 					defer freshCancel()
 					ctx = freshCtx
+					callWindowDerived = true
 				}
 			}
 		}
 	}
 
 	isStdio := t.service.TransportType == types.MCPTransportStdio
-	meta, _ := ToolExecFromContext(ctx)
+	meta := execMeta
 	oauthSess := oauthSessionFromToolExec(ctx, meta).withAuthWaitTimeout(t.authWaitTimeoutSeconds)
 	toolCallID := ""
 	if meta != nil {
@@ -253,14 +344,16 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 	// with a longer timeout were silently cancelled mid-flight even though the
 	// transport layers honor the value. Re-derive the window from ApprovalCtx —
 	// the round-level parent without the per-tool deadline. Skipped on the
-	// post-approval path, which already re-derived its window above and whose
-	// swapped ctx no longer carries the exec meta.
-	if meta != nil && meta.ApprovalCtx != nil {
+	// post-approval path, which already re-derived its window above.
+	if !callWindowDerived && meta != nil && meta.ApprovalCtx != nil {
 		callCtx, callCancel := context.WithTimeout(meta.ApprovalCtx, t.callToolTimeout(meta.ExecTimeout))
 		defer callCancel()
 		ctx = callCtx
 	}
 
+	// callClient is the connection the call last used, compared afterwards with
+	// the saved directory this tool was described from.
+	var callClient mcp.MCPClient
 	connectAndCall := func(callCtx context.Context) (*mcp.CallToolResult, error) {
 		client, err := getOrCreateMCPClientWithOAuthRetry(
 			callCtx, t.mcpManager, t.service, t.gate, oauthSess, t.mcpTool.Name, toolCallID,
@@ -268,6 +361,7 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 		if err != nil {
 			return nil, err
 		}
+		callClient = client
 		if isStdio {
 			defer func() {
 				if derr := client.Disconnect(); derr != nil {
@@ -278,8 +372,11 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 			}()
 		}
 
+		if err := hitl.CheckDelegation(callCtx); err != nil {
+			return nil, err
+		}
 		result, err := client.CallTool(callCtx, t.mcpTool.Name, input)
-		if err != nil && !isStdio {
+		if err != nil && !isStdio && callCtx.Err() == nil && mcp.IsToolCallRetrySafe(err) {
 			logger.GetLogger(callCtx).Warnf("MCP tool call failed, retrying with fresh connection: %v", err)
 			_ = client.Disconnect()
 
@@ -287,6 +384,10 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 				callCtx, t.mcpManager, t.service, t.gate, oauthSess, t.mcpTool.Name, toolCallID,
 			)
 			if err != nil {
+				return nil, err
+			}
+			callClient = client
+			if err := hitl.CheckDelegation(callCtx); err != nil {
 				return nil, err
 			}
 			result, err = client.CallTool(callCtx, t.mcpTool.Name, input)
@@ -297,24 +398,43 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 	result, err := connectAndCall(ctx)
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("MCP tool call failed: %v", err)
+		message := oauthAwareConnectError(t.service, err)
+		if t.revalidate != nil && mcp.IsDirectoryMismatch(err) {
+			rejected := "the server rejected tool " + t.mcpTool.Name + " as unknown or with invalid arguments"
+			// Invalid arguments alone do not mean the definition changed, so the
+			// model is sent back to discovery only when the server's tool differs.
+			if current, ok := t.revalidate(ctx, rejected, true); ok && t.definitionChanged(current) {
+				message += " The saved tool directory of this MCP server was out of date and has been " +
+					"refreshed. Rediscover the tool with discover_mcp_tools (list_tools, then describe) " +
+					"before calling it again."
+			}
+		}
 		return &types.ToolResult{
 			Success: false,
-			Error:   oauthAwareConnectError(t.service, err),
+			Error:   message,
 		}, nil
 	}
-
-	// Check if result indicates error
-	if result.IsError {
-		errorMsg := extractContentText(result.Content)
-		logger.GetLogger(ctx).Warnf("MCP tool returned error: %s", errorMsg)
-		return &types.ToolResult{
-			Success: false,
-			Error:   errorMsg,
-		}, nil
+	if reason := t.directoryDrift(callClient); reason != "" {
+		// The call already ran against the live server; only later reads change.
+		t.revalidate(ctx, reason, false)
 	}
 
 	// Extract text content and image data URIs from result
-	output, images, skipped := extractContentAndImages(result.Content)
+	var output string
+	var images []string
+	var skipped int
+	if result.IsError {
+		output = extractContentText(result.Content)
+	} else {
+		output, images, skipped = extractContentAndImages(result.Content)
+	}
+	output, err = appendMCPStructuredContent(output, result.Content, result.StructuredContent)
+	if err != nil {
+		return &types.ToolResult{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to serialize MCP structured result: %v", err),
+		}, nil
+	}
 	if skipped > 0 {
 		logger.GetLogger(ctx).Warnf("MCP tool %s: %d image(s) skipped (exceeded count/size/MIME limits)", t.mcpTool.Name, skipped)
 	}
@@ -328,6 +448,14 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 	// double storage in memory and accidental exposure in logs/SSE.
 	data := make(map[string]interface{})
 	data["content_items"] = redactImageData(result.Content)
+	if result.StructuredContent != nil {
+		data["structured_content"] = result.StructuredContent
+	}
+
+	if result.IsError {
+		logger.GetLogger(ctx).Warnf("MCP tool returned error: %s", output)
+		return &types.ToolResult{Success: false, Error: output, Data: data}, nil
+	}
 
 	logger.GetLogger(ctx).Infof("MCP tool executed successfully: %s (images: %d)", t.mcpTool.Name, len(images))
 
@@ -337,6 +465,41 @@ func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (*types.Too
 		Data:    data,
 		Images:  images,
 	}, nil
+}
+
+// appendMCPStructuredContent makes structured results visible to the model,
+// whose tool messages consume Output/Error rather than the Data map. Servers
+// may also return serialized JSON as a compatibility text block; keep that
+// block without appending the same payload a second time.
+func appendMCPStructuredContent(output string, content []mcp.ContentItem, structured any) (string, error) {
+	if structured == nil {
+		return output, nil
+	}
+	payload, err := json.Marshal(structured)
+	if err != nil {
+		return "", err
+	}
+	for _, item := range content {
+		if item.Type != "text" {
+			continue
+		}
+		var fallback any
+		if json.Unmarshal([]byte(item.Text), &fallback) == nil {
+			canonical, _ := json.Marshal(fallback)
+			if bytes.Equal(canonical, payload) {
+				return output, nil
+			}
+		}
+	}
+	// The legacy extractor substitutes a success placeholder for empty content.
+	// Structured-only results have real output, so omit that placeholder.
+	if len(content) == 0 {
+		output = ""
+	}
+	if output != "" {
+		output += "\n\n"
+	}
+	return output + "Structured content:\n" + string(payload), nil
 }
 
 const (
@@ -388,8 +551,8 @@ func extractContentAndImages(content []mcp.ContentItem) (text string, images []s
 			} else if item.Data != "" {
 				skippedImages++
 			}
-		case "resource":
-			textParts = append(textParts, fmt.Sprintf("[Resource: %s]", item.MimeType))
+		case "resource", "resource_link":
+			textParts = append(textParts, resourceText(item))
 		default:
 			if item.Text != "" {
 				textParts = append(textParts, item.Text)
@@ -406,14 +569,37 @@ func extractContentAndImages(content []mcp.ContentItem) (text string, images []s
 	return text, images, skippedImages
 }
 
-// redactImageData returns a copy of content items with image Data fields replaced
-// by a size indicator. This prevents large base64 strings from being stored in the
-// Data map (which may be serialized to logs or SSE events).
+// resourceText renders a resource item for the model: a reference to the
+// resource, followed by its text when the tool embedded a text resource, so
+// the content itself reaches the model.
+func resourceText(item mcp.ContentItem) string {
+	label := "Resource"
+	if item.Type == "resource_link" {
+		label = "Resource link"
+	}
+	ref := item.MimeType
+	switch {
+	case item.URI != "" && item.MimeType != "":
+		ref = fmt.Sprintf("%s (%s)", item.URI, item.MimeType)
+	case item.URI != "":
+		ref = item.URI
+	}
+	placeholder := fmt.Sprintf("[%s: %s]", label, ref)
+	if item.Type == "resource" && item.Text != "" {
+		return placeholder + "\n" + item.Text
+	}
+	return placeholder
+}
+
+// redactImageData returns a copy of content items with base64 Data fields, of
+// images, audio and blob resources, replaced by a size indicator. This prevents
+// large base64 strings from being stored in the Data map (which may be
+// serialized to logs or SSE events).
 func redactImageData(content []mcp.ContentItem) []mcp.ContentItem {
 	redacted := make([]mcp.ContentItem, len(content))
 	for i, item := range content {
 		redacted[i] = item
-		if item.Type == "image" && item.Data != "" {
+		if item.Data != "" {
 			redacted[i].Data = fmt.Sprintf("[redacted, base64_len=%d]", len(item.Data))
 		}
 	}
@@ -438,9 +624,8 @@ func extractContentText(content []mcp.ContentItem) string {
 				mimeType = "image"
 			}
 			textParts = append(textParts, fmt.Sprintf("[Image: %s]", mimeType))
-		case "resource":
-			// For resources, include a reference
-			textParts = append(textParts, fmt.Sprintf("[Resource: %s]", item.MimeType))
+		case "resource", "resource_link":
+			textParts = append(textParts, resourceText(item))
 		default:
 			// For other types, try to include any text or data
 			if item.Text != "" {
@@ -494,7 +679,21 @@ func sanitizeName(name string) string {
 // publish a partial tools/list.
 type MCPMetadataIO struct {
 	Get func(context.Context, uint64, string) (*types.MCPMetadata, error)
-	Put func(context.Context, uint64, string, []*types.MCPTool, string) error
+	Put func(context.Context, uint64, string, []*types.MCPTool, string, types.MCPServerInfo, time.Time) error
+	// Revalidator re-lists saved directories that may be out of date. It needs
+	// Put; without either, saved directories change only on explicit refresh.
+	Revalidator *MCPDirectoryRevalidator
+}
+
+// mcpDirectory is one service's tool directory, either saved or listed live.
+type mcpDirectory struct {
+	tools        []*types.MCPTool
+	instructions string
+	server       types.MCPServerInfo
+	// saved and syncedAt describe a directory read from storage; syncedAt is
+	// when it was listed, zero when unknown.
+	saved    bool
+	syncedAt time.Time
 }
 
 func loadMCPDirectory(
@@ -505,7 +704,7 @@ func loadMCPDirectory(
 	oauthSess *MCPOAuthSession,
 	metadata *MCPMetadataIO,
 	live bool,
-) ([]*types.MCPTool, string, error) {
+) (*mcpDirectory, error) {
 	if metadata == nil || metadata.Get == nil {
 		return loadMCPServiceTools(loadCtx, service, mcpManager, gate, oauthSess)
 	}
@@ -513,32 +712,84 @@ func loadMCPDirectory(
 	if !live {
 		snapshot, err := metadata.Get(loadCtx, tenant, service.ID)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		if snapshot != nil && snapshot.Stale {
-			return nil, "", fmt.Errorf("MCP directory is stale; refresh Tools in Settings > MCP management")
+			return nil, fmt.Errorf("MCP directory is stale; refresh Tools in Settings > MCP management")
 		}
 		if snapshot != nil {
-			return snapshot.Tools, snapshot.Instructions, nil
+			return &mcpDirectory{
+				tools:        snapshot.Tools,
+				instructions: snapshot.Instructions,
+				server: types.MCPServerInfo{
+					Name:        snapshot.ServerName,
+					Version:     snapshot.ServerVersion,
+					Description: snapshot.ServerDescription,
+				},
+				saved:    true,
+				syncedAt: snapshot.SyncedAt,
+			}, nil
 		}
 	}
 	if service.AuthConfig.IsOAuth() {
 		if _, ok := ToolExecFromContext(loadCtx); !ok {
-			return nil, "", fmt.Errorf("MCP directory is missing; authorize this service, then refresh Tools")
+			return nil, fmt.Errorf("MCP directory is missing; authorize this service, then refresh Tools")
 		}
 	}
-	definitions, instructions, err := loadMCPServiceTools(loadCtx, service, mcpManager, gate, oauthSess)
+	listedAt := time.Now()
+	directory, err := loadMCPServiceTools(loadCtx, service, mcpManager, gate, oauthSess)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if metadata.Put != nil {
-		if persistErr := metadata.Put(loadCtx, tenant, service.ID, definitions, instructions); persistErr != nil {
+		if persistErr := metadata.Put(
+			loadCtx, tenant, service.ID, directory.tools, directory.instructions, directory.server, listedAt,
+		); persistErr != nil {
 			logger.GetLogger(loadCtx).Warnf(
 				"Failed to persist MCP directory for service %s: %v", service.Name, persistErr,
 			)
 		}
 	}
-	return definitions, instructions, nil
+	return directory, nil
+}
+
+// relistMCPDirectory replaces a saved directory with the server's current one,
+// read over a fresh connection so the instructions and version are current
+// too. It never opens an in-conversation OAuth prompt: a re-list that needs
+// authorization fails and leaves the saved directory as it was.
+func relistMCPDirectory(
+	ctx context.Context,
+	service *types.MCPService,
+	mcpManager *mcp.MCPManager,
+	metadata *MCPMetadataIO,
+	catalog *MCPCatalog,
+) ([]*types.MCPTool, error) {
+	if mcpManager == nil {
+		return nil, fmt.Errorf("MCP connections are unavailable")
+	}
+	listedAt := time.Now()
+	current, err := mcpManager.ReadDirectory(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	server := types.MCPServerInfo{
+		Name:        current.Initialize.ServerInfo.Name,
+		Version:     current.Initialize.ServerInfo.Version,
+		Description: current.Initialize.ServerInfo.Description,
+	}
+	tenant, _ := types.TenantIDFromContext(ctx)
+	// The directory is written even when it is unchanged, so its age restarts.
+	// It is dated by when the listing started, so a settings refresh that
+	// started later is never replaced by it, nor it by an earlier one.
+	if err := metadata.Put(
+		ctx, tenant, service.ID, current.Tools, current.Initialize.Instructions, server, listedAt,
+	); err != nil {
+		return nil, err
+	}
+	if catalog != nil {
+		catalog.markForReload(service.ID)
+	}
+	return current.Tools, nil
 }
 
 // RegisterMCPTools installs a scoped directory and call proxy without connecting
@@ -554,28 +805,62 @@ func RegisterMCPTools(
 	lookup MCPServiceLookup,
 	metadata *MCPMetadataIO,
 ) (int, error) {
-	catalog := newMCPCatalog(
+	var catalog *MCPCatalog
+	var revalidator *MCPDirectoryRevalidator
+	if metadata != nil && metadata.Put != nil {
+		revalidator = metadata.Revalidator
+	}
+	revalidate := func(
+		ctx context.Context, service *types.MCPService, reason string, wait bool,
+	) ([]*types.MCPTool, bool) {
+		current, ok := revalidator.trigger(
+			ctx, mcpRevalidationKey(ctx, service), reason+" service="+service.Name, wait,
+			func(runCtx context.Context) ([]*types.MCPTool, error) {
+				return relistMCPDirectory(runCtx, service, mcpManager, metadata, catalog)
+			},
+		)
+		if ok {
+			// The re-list may have been started by another engine, which marked
+			// only its own catalog.
+			catalog.markForReload(service.ID)
+		}
+		return current, ok
+	}
+	catalog = newMCPCatalog(
 		ctx,
 		services,
 		gate,
 		func(loadCtx context.Context, service *types.MCPService, live bool) ([]*MCPTool, error) {
 			meta, _ := ToolExecFromContext(loadCtx)
 			oauthSess := oauthSessionFromToolExec(loadCtx, meta).withAuthWaitTimeout(authWaitTimeoutSeconds)
-			definitions, instructions, err := loadMCPDirectory(
+			directory, err := loadMCPDirectory(
 				loadCtx, service, mcpManager, gate, oauthSess, metadata, live,
 			)
 			if err != nil {
 				return nil, err
 			}
-			tools := make([]*MCPTool, 0, len(definitions))
+			if directory.saved && revalidator.expired(directory.syncedAt) {
+				// Serve the saved directory now; the next read picks up the new one.
+				revalidate(loadCtx, service, "saved directory is older than the maximum age", false)
+			}
+			tools := make([]*MCPTool, 0, len(directory.tools))
 			seen := make(map[string]bool)
-			for _, definition := range definitions {
+			for _, definition := range directory.tools {
 				if definition == nil || definition.Name == "" || seen[definition.Name] {
 					continue
 				}
 				seen[definition.Name] = true
 				tool := NewMCPTool(service, definition, mcpManager, gate, authWaitTimeoutSeconds)
-				tool.serverInstructions = instructions
+				tool.serverInstructions = directory.instructions
+				tool.serverVersion = directory.server.Version
+				if directory.saved {
+					tool.savedAt = directory.syncedAt
+				}
+				if revalidator != nil {
+					tool.revalidate = func(ctx context.Context, reason string, wait bool) ([]*types.MCPTool, bool) {
+						return revalidate(ctx, service, reason, wait)
+					}
+				}
 				tools = append(tools, tool)
 			}
 			return tools, nil
@@ -604,7 +889,7 @@ func loadMCPServiceTools(
 	mcpManager *mcp.MCPManager,
 	gate approval.MCPApproval,
 	regOAuth *MCPOAuthSession,
-) ([]*types.MCPTool, string, error) {
+) (*mcpDirectory, error) {
 	const listToolsTimeout = 30 * time.Second
 	toolCallID := "mcp-discover-" + service.ID
 	if meta, ok := ToolExecFromContext(ctx); ok && meta != nil {
@@ -615,7 +900,7 @@ func loadMCPServiceTools(
 	)
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("Failed to create MCP client for service %s: %v", service.Name, err)
-		return nil, "", err
+		return nil, err
 	}
 
 	// For stdio transport, ensure connection is released after listing tools
@@ -644,7 +929,7 @@ func loadMCPServiceTools(
 		)
 		if err != nil {
 			logger.GetLogger(ctx).Errorf("Failed to reconnect MCP client for service %s: %v", service.Name, err)
-			return nil, "", err
+			return nil, err
 		}
 
 		retryCtx, retryCancel := context.WithTimeout(ctx, listToolsTimeout)
@@ -654,14 +939,18 @@ func loadMCPServiceTools(
 
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("Failed to list tools from MCP service %s: %v", service.Name, err)
-		return nil, "", err
+		return nil, err
 	}
 
-	instructions := ""
+	directory := &mcpDirectory{tools: mcpTools}
 	if provider, ok := client.(interface{ ServerInstructions() string }); ok {
-		instructions = provider.ServerInstructions()
+		directory.instructions = provider.ServerInstructions()
 	}
-	return mcpTools, instructions, nil
+	if provider, ok := client.(interface{ ServerInfo() mcp.ServerInfo }); ok {
+		info := provider.ServerInfo()
+		directory.server = types.MCPServerInfo{Name: info.Name, Version: info.Version, Description: info.Description}
+	}
+	return directory, nil
 }
 
 // MCPToolNamesByServiceID returns registered MCP tool names grouped by service ID.
@@ -752,4 +1041,65 @@ func SerializeMCPToolResult(result *types.ToolResult) (string, error) {
 	}
 
 	return output, nil
+}
+
+// definitionChanged reports whether this tool is missing from the server's
+// current tools or has a different input schema there. Schemas are compared as
+// JSON values: a saved directory comes back from storage with its keys and
+// spacing normalized.
+func (t *MCPTool) definitionChanged(current []*types.MCPTool) bool {
+	for _, tool := range current {
+		if tool == nil || tool.Name != t.mcpTool.Name {
+			continue
+		}
+		var saved, live any
+		if json.Unmarshal(t.mcpTool.InputSchema, &saved) != nil || json.Unmarshal(tool.InputSchema, &live) != nil {
+			return !bytes.Equal(t.mcpTool.InputSchema, tool.InputSchema)
+		}
+		return !reflect.DeepEqual(saved, live)
+	}
+	return true
+}
+
+// directoryDrift reports how the server behind client differs from the saved
+// directory this tool was described from, or "" when no difference is visible.
+// Only a connection initialized after the directory was saved can show that
+// the server changed since; an older connection still holds what the server
+// reported back then. A server version is compared only when the server
+// reports one; a saved directory without a recorded version differs once, so
+// its version gets recorded. Instructions are compared as reported.
+func (t *MCPTool) directoryDrift(client mcp.MCPClient) string {
+	if t.revalidate == nil || client == nil {
+		return ""
+	}
+	provider, ok := client.(interface{ InitializedAt() time.Time })
+	if !ok {
+		return ""
+	}
+	if initialized := provider.InitializedAt(); initialized.IsZero() || !initialized.After(t.savedAt) {
+		return ""
+	}
+	if provider, ok := client.(interface{ ServerInfo() mcp.ServerInfo }); ok {
+		if live := provider.ServerInfo().Version; live != "" && live != t.serverVersion {
+			return "the server version changed from " + strconv.Quote(t.serverVersion) + " to " + strconv.Quote(live)
+		}
+	}
+	if provider, ok := client.(interface{ ServerInstructions() string }); ok {
+		if provider.ServerInstructions() != t.serverInstructions {
+			return "the server instructions changed"
+		}
+	}
+	return ""
+}
+
+// approvalGrant is what approving a call of this tool may allow for the rest
+// of the session: calls of the same tool while its argument schema stays the
+// same, so a changed tool asks again.
+func (t *MCPTool) approvalGrant(ctx context.Context) (grant, scope string) {
+	sum := sha256.Sum256(t.mcpTool.InputSchema)
+	grant = "mcp:" + t.service.ID + "/" + t.mcpTool.Name + "#" + hex.EncodeToString(sum[:6])
+	if strings.HasPrefix(types.LanguageFromContextOrDefault(ctx), "zh") {
+		return grant, fmt.Sprintf("调用 %s 的工具 %s", t.service.Name, t.mcpTool.Name)
+	}
+	return grant, fmt.Sprintf("Call %s tool %s", t.service.Name, t.mcpTool.Name)
 }

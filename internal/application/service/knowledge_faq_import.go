@@ -1975,7 +1975,12 @@ func (s *knowledgeService) incrementalIndexFAQEntry(
 		logger.Debugf(ctx, "incrementalIndexFAQEntry: updated similar questions (answers changed): %v", updatedQuestions)
 	}
 
-	// 3. 删除不再存在的相似问索引
+	// 3. 删除不再存在的相似问索引，以及即将重建的旧索引。
+	// 不能依赖 BatchIndex 覆盖同一 SourceID：ES v8、Qdrant 等引擎每次写入
+	// 生成新文档 ID，不先删会留下内容过期的重复条目。
+	for _, info := range indexInfoToUpdate {
+		sourceIDsToDelete = append(sourceIDsToDelete, info.SourceID)
+	}
 	if len(sourceIDsToDelete) > 0 {
 		logger.Debugf(ctx, "incrementalIndexFAQEntry: deleting %d obsolete sourceIDs: %v", len(sourceIDsToDelete), sourceIDsToDelete)
 		if delErr := retrieveEngine.DeleteBySourceIDList(ctx, sourceIDsToDelete, embeddingModel.GetDimensions(), types.KnowledgeTypeFAQ); delErr != nil {
@@ -2268,6 +2273,22 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		return fmt.Errorf("%w: FAQ task document does not belong to its KB", asynq.SkipRetry)
 	}
 
+	// A replay must not start writing progress for another accepted import.
+	// Missing markers can expire before a manual retry; retain that recovery
+	// path and the existing timestamp fallback for legacy task instances.
+	running, err := s.getRunningFAQImportInfo(ctx, payload.KBID)
+	if err != nil {
+		return fmt.Errorf("failed to check FAQ import instance: %w", err)
+	}
+	if running != nil {
+		if err := secutils.ValidateTaskID(running.TaskID); err != nil {
+			return fmt.Errorf("invalid running FAQ import task ID: %w", err)
+		}
+		if !runningFAQImportInfoMatches(running, payload.TaskID, payload.InstanceID, payload.EnqueuedAt) {
+			return fmt.Errorf("%w: another FAQ import instance owns this KB", asynq.SkipRetry)
+		}
+	}
+
 	// 获取任务重试信息，用于判断是否是最后一次重试
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	maxRetry, _ := asynq.GetMaxRetry(ctx)
@@ -2276,7 +2297,10 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	tenantInfo, err := s.tenantRepo.GetTenantByID(ctx, payload.TenantID)
 	if err != nil {
 		logger.Errorf(ctx, "failed to get tenant: %v", err)
-		return nil
+		if errors.Is(err, repository.ErrTenantNotFound) {
+			return fmt.Errorf("%w: FAQ task tenant no longer exists", asynq.SkipRetry)
+		}
+		return fmt.Errorf("failed to get FAQ import tenant: %w", err)
 	}
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
 
@@ -2675,8 +2699,8 @@ func (s *knowledgeService) executeFAQMergeOperations(
 			return mergedCount, fmt.Errorf("failed to batch save merged chunks: %w", err)
 		}
 
-		// 4. 重建索引（EFPutDocument 会自动覆盖相同 SourceID）
-		if err := s.indexFAQChunks(ctx, kb, faqKnowledge, mergedChunks, embeddingModel, false, false); err != nil {
+		// 4. 重建索引。先删旧索引：ES v8、Qdrant 等引擎不会覆盖相同 SourceID。
+		if err := s.indexFAQChunks(ctx, kb, faqKnowledge, mergedChunks, embeddingModel, false, true); err != nil {
 			return mergedCount, fmt.Errorf("failed to re-index merged chunks: %w", err)
 		}
 

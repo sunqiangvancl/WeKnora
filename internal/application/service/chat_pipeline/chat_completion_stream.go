@@ -4,12 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 )
+
+// EmptyTruncatedAnswerFallback explains an output-budget exhaustion with no answer text.
+const EmptyTruncatedAnswerFallback = "Sorry, this answer hit the model's per-response output limit " +
+	"before any text was produced. Try narrowing the question, or raise max_completion_tokens."
+
+// IsLengthFinishReason reports whether a provider ended a response because its
+// completion-token budget was exhausted.
+func IsLengthFinishReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length", "max_tokens", "max_output_tokens":
+		return true
+	default:
+		return false
+	}
+}
 
 // PluginChatCompletionStream implements streaming chat completion functionality
 // as a plugin that can be registered to EventManager
@@ -114,6 +130,17 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 		answerID := fmt.Sprintf("%s-answer", uuid.New().String()[:8])
 		thinkingOpen := false
 		answerCompleted := false
+		answerProduced := false
+		// Providers report usage on the final stream chunk; keep the latest
+		// seen so the closing answer event can hand it to the QA turn
+		// (issue #3865: the complete event carried no usage on this path).
+		var turnUsage *types.TokenUsage
+		// The assembler emits the finish chunk (Done, no usage) BEFORE its End
+		// emission (Done, usage) — completing the turn on the first Done would
+		// drop the usage trailer. The closing event is therefore stashed here
+		// and emitted when the channel closes (or on cancel, where a stashed
+		// answer still means the turn finished).
+		var pendingClose *event.AgentFinalAnswerData
 
 		closeThinking := func() {
 			if !thinkingOpen {
@@ -161,6 +188,20 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 			case <-ctx.Done():
 				flushDecoders()
 				closeThinking()
+				if pendingClose != nil {
+					// The answer finished before the cancel; close it so the
+					// turn is not mistaken for a stopped one.
+					if turnUsage != nil {
+						pendingClose.Usage = turnUsage
+					}
+					_ = eventBus.Emit(ctx, types.Event{
+						ID:        answerID,
+						Type:      types.EventType(event.EventAgentFinalAnswer),
+						SessionID: chatManage.SessionID,
+						Data:      *pendingClose,
+					})
+					pendingClose = nil
+				}
 				pipelineInfo(ctx, "Stream", "context_cancelled", map[string]interface{}{
 					"session_id": chatManage.SessionID,
 				})
@@ -170,12 +211,32 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 				if !ok {
 					flushDecoders()
 					closeThinking()
+					if pendingClose != nil {
+						if turnUsage != nil {
+							pendingClose.Usage = turnUsage
+						}
+						_ = eventBus.Emit(ctx, types.Event{
+							ID:        answerID,
+							Type:      types.EventType(event.EventAgentFinalAnswer),
+							SessionID: chatManage.SessionID,
+							Data:      *pendingClose,
+						})
+						pendingClose = nil
+					}
 					pipelineInfo(ctx, "Stream", "channel_close", map[string]interface{}{
 						"session_id": chatManage.SessionID,
 					})
 					return
 				}
 
+				// A stream that stopped without a finish reason is a broken
+				// one, not a short answer: report it the way a read error is
+				// reported instead of closing the answer as complete.
+				if response.ResponseType == types.ResponseTypeAnswer && response.Done &&
+					response.FinishReason == types.FinishReasonIncomplete {
+					response.ResponseType = types.ResponseTypeError
+					response.Content = types.StreamEndedEarlyError
+				}
 				if response.ResponseType == types.ResponseTypeError {
 					pipelineError(ctx, "Stream", "stream_error", map[string]interface{}{
 						"session_id": chatManage.SessionID,
@@ -218,28 +279,46 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 				}
 
 				if response.ResponseType == types.ResponseTypeAnswer {
-					// Providers can emit a completion once for finish_reason and again
-					// for their EOF sentinel. A final answer is a terminal event for a
-					// single stream, so forwarding a later duplicate would put an answer
-					// after the session's complete event.
+					if response.Usage != nil {
+						turnUsage = response.Usage
+					}
+					// The finish chunk and the assembler's End emission both
+					// arrive as Done answers; the first is stashed (below) and
+					// a later one can only refresh the usage the closing event
+					// will carry.
 					if answerCompleted {
 						continue
 					}
 					response.Content = answerDecoder.Feed(response.Content)
-					if response.Done {
-						response.Content += answerDecoder.Flush()
-						answerCompleted = true
+					if strings.TrimSpace(response.Content) != "" {
+						answerProduced = true
+					}
+					if !response.Done {
+						closeThinking()
+						_ = eventBus.Emit(ctx, types.Event{
+							ID:        answerID,
+							Type:      types.EventType(event.EventAgentFinalAnswer),
+							SessionID: chatManage.SessionID,
+							Data:      event.AgentFinalAnswerData{Content: response.Content},
+						})
+						continue
+					}
+					// Terminal chunk: stash the closing event instead of
+					// emitting it, so the usage trailer on the assembler's End
+					// chunk is still ahead of us.
+					response.Content += answerDecoder.Flush()
+					answerCompleted = true
+					truncated := IsLengthFinishReason(response.FinishReason)
+					if truncated && !answerProduced {
+						response.Content = EmptyTruncatedAnswerFallback
+						answerProduced = true
 					}
 					closeThinking()
-					eventBus.Emit(ctx, types.Event{
-						ID:        answerID,
-						Type:      types.EventType(event.EventAgentFinalAnswer),
-						SessionID: chatManage.SessionID,
-						Data: event.AgentFinalAnswerData{
-							Content: response.Content,
-							Done:    response.Done,
-						},
-					})
+					pendingClose = &event.AgentFinalAnswerData{
+						Content:   response.Content,
+						Done:      true,
+						Truncated: truncated,
+					}
 				}
 			}
 		}

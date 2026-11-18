@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
@@ -159,6 +160,11 @@ func (c *Connector) walk(
 		return nil, nil, err
 	}
 	cli := newClient(cfg)
+	settings := parseFolderSettings(ctx, config)
+	if settings.FolderMode != folderModeNone {
+		logger.Infof(ctx, "[Yuque] folder path derivation enabled: folder_mode=%s toc_only=%t",
+			settings.FolderMode, settings.TOCOnly)
+	}
 
 	newCursor := &yuqueCursor{LastSyncTime: time.Now(), BookDocTimes: make(map[string]map[string]string)}
 	var out []types.FetchedItem
@@ -174,11 +180,34 @@ func (c *Connector) walk(
 			return nil, nil, fmt.Errorf("list docs for book %d: %w", bookID, err)
 		}
 
+		// Optionally fetch the book's table of contents and fold it into a
+		// per-document folder path. One request per book per sync.
+		//
+		// tocOK separates "the TOC was fetched and this document is not in it"
+		// from "we could not fetch the TOC at all". Both the path assembly and
+		// the toc_only filter depend on that distinction: with no TOC we must
+		// degrade to the previous flat behaviour rather than silently dropping
+		// every document.
+		var tocSegs map[int64][]string
+		var inTOC map[int64]bool
+		tocOK := false
+		if settings.FolderMode == folderModeTOC {
+			toc, tocErr := cli.ListBookTOC(ctx, bookID)
+			if tocErr != nil {
+				logger.Warnf(ctx, "[Yuque] book %d: fetch TOC failed, falling back to flat file names: %v",
+					bookID, tocErr)
+			} else {
+				tocSegs, inTOC = buildTOCPaths(toc)
+				tocOK = true
+			}
+		}
+		bookName := ""
+
 		currentDocs := make(map[string]bool)
 		newCursor.BookDocTimes[bookIDStr] = make(map[string]string)
 
-		var skippedType, skippedDraft, kept int
-		var sampleSkipType, sampleSkipDraft string
+		var skippedType, skippedDraft, skippedNotInTOC, kept int
+		var sampleSkipType, sampleSkipDraft, sampleSkipNotInTOC string
 		for _, d := range docs {
 			// Empty type/status is treated as acceptable — forward-compat with
 			// API variations that omit the field.
@@ -196,15 +225,38 @@ func (c *Connector) walk(
 				}
 				continue
 			}
-			kept++
+			// Mark the document as seen so the deletion detector does not treat a
+			// filtered document as removed from the source. toc_only is an
+			// admission filter: it decides what enters the knowledge base, not what
+			// leaves it. Reporting these as deleted would remove exactly the
+			// documents the Yuque web UI cannot show (created through the API,
+			// never attached to the TOC), leaving their content unreachable from
+			// both sides.
 			docIDStr := strconv.FormatInt(d.ID, 10)
 			currentDocs[docIDStr] = true
+
+			// Filter out documents that do not appear in the TOC. Applies only when
+			// the TOC was actually fetched — see the tocOK comment above. The
+			// predicate is membership in the TOC node list, not "has a path":
+			// a document may sit in the TOC with no enclosing group.
+			if settings.TOCOnly && tocOK && !inTOC[d.ID] {
+				skippedNotInTOC++
+				if sampleSkipNotInTOC == "" {
+					sampleSkipNotInTOC = fmt.Sprintf("id=%d title=%q", d.ID, d.Title)
+				}
+				continue
+			}
+			kept++
+			// Only admitted documents enter the cursor. A filtered document has to
+			// stay unknown to the incremental comparison, so that admitting it
+			// later — by attaching it to the TOC, or by switching toc_only off —
+			// ingests it rather than dismissing it as unchanged.
 			newCursor.BookDocTimes[bookIDStr][docIDStr] = d.ContentUpdatedAt
 
 			// Incremental: skip if content hasn't changed.
 			if incremental && prev != nil && prev.BookDocTimes != nil {
 				if prevTimes, ok := prev.BookDocTimes[bookIDStr]; ok {
-					if prevTimes[docIDStr] == d.ContentUpdatedAt {
+					if d.ContentUpdatedAt != "" && prevTimes[docIDStr] == d.ContentUpdatedAt {
 						continue
 					}
 				}
@@ -218,6 +270,19 @@ func (c *Connector) walk(
 
 			detail, err := cli.GetDocDetail(ctx, d.ID)
 			if err != nil {
+				// Do not acknowledge the doc's new version when its detail fetch
+				// failed: rewind the cursor entry to the previously synced version
+				// (existing docs) or drop it (new docs), so the next incremental
+				// sync re-fetches the doc once the endpoint recovers. Acking before
+				// the fetch succeeded made the doc silently skipped by every later
+				// incremental sync (Tencent/WeKnora#3690). The doc stays in
+				// currentDocs, so deletion detection is unaffected.
+				if prev != nil && prev.BookDocTimes != nil {
+					newCursor.BookDocTimes[bookIDStr][docIDStr] = prev.BookDocTimes[bookIDStr][docIDStr]
+				}
+				if newCursor.BookDocTimes[bookIDStr][docIDStr] == "" {
+					delete(newCursor.BookDocTimes[bookIDStr], docIDStr)
+				}
 				// Record failure but continue (placeholder item with error metadata).
 				// Keep doc_id/book_id/slug for observability pipelines that join on these.
 				out = append(out, types.FetchedItem{
@@ -242,27 +307,52 @@ func (c *Connector) walk(
 			if detail.Format != "" && detail.Format != "markdown" && detail.Format != "lake" {
 				logger.Warnf(ctx, "[Yuque] skip doc %d (%q): unsupported format %q",
 					d.ID, d.Title, detail.Format)
-				out = append(out, types.FetchedItem{
-					ExternalID:       docIDStr,
-					Title:            d.Title,
-					SourceResourceID: bookIDStr,
-					Metadata: map[string]string{
-						"channel":     types.ChannelYuque,
-						"doc_id":      docIDStr,
-						"book_id":     bookIDStr,
-						"slug":        d.Slug,
-						"skip_reason": "unsupported format: " + detail.Format,
-					},
-				})
+				out = append(out, skippedDocItem(docIDStr, bookIDStr, d.Slug, d.Title,
+					"unsupported format: "+detail.Format))
 				continue
 			}
+
+			// A blank body is not a document. Never fall through to the URL
+			// path for it: the datasource service would download the Yuque web
+			// page, which is an SPA shell, and index that as content.
+			if trimBodyForClassification(detail.Body) == "" {
+				logger.Warnf(ctx, "[Yuque] skip doc %d (%q): empty document body", d.ID, d.Title)
+				out = append(out, skippedDocItem(docIDStr, bookIDStr, d.Slug, d.Title,
+					"empty document body"))
+				continue
+			}
+			// The Yuque API occasionally returns the app shell instead of the
+			// document body (for example for a node the caller cannot export).
+			// Storing it as Markdown would index webpack scripts and analytics
+			// as knowledge, so skip it with an explicit reason.
+			if isHTMLPageShell(detail.Body) {
+				logger.Warnf(ctx, "[Yuque] skip doc %d (%q): body is an HTML page shell", d.ID, d.Title)
+				out = append(out, skippedDocItem(docIDStr, bookIDStr, d.Slug, d.Title,
+					"document body is an HTML page shell"))
+				continue
+			}
+
+			// Book title for the leading path segment. The detail response
+			// already carries it, so this costs no extra API call. Captured
+			// once per book; falls back to the namespace, then to no prefix.
+			if bookName == "" {
+				bookName = strings.TrimSpace(detail.Book.Name)
+				if bookName == "" {
+					bookName = strings.TrimSpace(detail.Book.Namespace)
+				}
+			}
+
+			// folder_path is derived downstream from FileName alone
+			// (SplitKnowledgeRelativePath → NormalizeKnowledgeFolderPath), so the
+			// hierarchy has to be encoded here as a relative path.
+			fileName := buildFolderFileName(settings, tocOK, bookName, tocSegs[d.ID], d.Title)
 
 			out = append(out, types.FetchedItem{
 				ExternalID:       docIDStr,
 				Title:            d.Title,
 				Content:          []byte(detail.Body),
 				ContentType:      "text/markdown",
-				FileName:         datasource.SanitizeFileName(d.Title) + ".md",
+				FileName:         fileName,
 				URL:              buildDocURL(cfg.GetBaseURL(), detail.Book.Namespace, d.Slug),
 				UpdatedAt:        parseContentUpdatedAt(d.ContentUpdatedAt),
 				SourceResourceID: bookIDStr,
@@ -277,8 +367,11 @@ func (c *Connector) walk(
 			})
 		}
 
-		logger.Infof(ctx, "[Yuque] book %d: total=%d kept=%d skipped_non_doc=%d skipped_draft=%d non_doc_sample={%s} draft_sample={%s}",
-			bookID, len(docs), kept, skippedType, skippedDraft, sampleSkipType, sampleSkipDraft)
+		logger.Infof(ctx, "[Yuque] book %d: total=%d kept=%d skipped_non_doc=%d skipped_draft=%d "+
+			"skipped_not_in_toc=%d toc_loaded=%t non_doc_sample={%s} draft_sample={%s} "+
+			"not_in_toc_sample={%s}",
+			bookID, len(docs), kept, skippedType, skippedDraft, skippedNotInTOC, tocOK,
+			sampleSkipType, sampleSkipDraft, sampleSkipNotInTOC)
 
 		// Deletion detection (incremental only): previous doc IDs not in current → IsDeleted=true
 		if incremental && prev != nil && prev.BookDocTimes != nil {
@@ -296,10 +389,55 @@ func (c *Connector) walk(
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if !incremental {
 		return out, nil, nil
 	}
 	return out, newCursor, nil
+}
+
+// skippedDocItem builds a content-less placeholder for a document the
+// connector cannot ingest. The URL stays empty on purpose: the datasource
+// service treats an item with a URL as a URL document and downloads the page,
+// which for a Yuque book page is the SPA shell rather than the document body.
+func skippedDocItem(docIDStr, bookIDStr, slug, title, reason string) types.FetchedItem {
+	return types.FetchedItem{
+		ExternalID:       docIDStr,
+		Title:            title,
+		SourceResourceID: bookIDStr,
+		Metadata: map[string]string{
+			"channel":     types.ChannelYuque,
+			"doc_id":      docIDStr,
+			"book_id":     bookIDStr,
+			"slug":        slug,
+			"skip_reason": reason,
+		},
+	}
+}
+
+func trimBodyForClassification(body string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(body), "\ufeff"))
+}
+
+// isHTMLPageShell reports a body that is the Yuque web app's HTML shell rather
+// than Markdown. A Markdown document may legitimately contain HTML, but it does
+// not start with a document-type declaration or an <html> root element.
+func isHTMLPageShell(body string) bool {
+	trimmed := trimBodyForClassification(body)
+	// Only the opening declarations matter; do not lowercase a whole document.
+	if len(trimmed) > 512 {
+		trimmed = trimmed[:512]
+	}
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{"<!doctype html", "<html"} {
+		rest, ok := strings.CutPrefix(lower, prefix)
+		if ok && len(rest) > 0 && strings.ContainsRune(" \t\r\n\f/>", rune(rest[0])) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDocURL constructs a browser URL for a Yuque doc.

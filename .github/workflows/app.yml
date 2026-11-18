@@ -19,11 +19,19 @@ on:
       - "migrations/**"
       - "skills/preloaded/**"
       - "testdata/**"
+      - "website-docs/0*/**"
+      - "website-docs/.vitepress/config.mts"
       - "docker/Dockerfile.app"
+      - "scripts/docker-entrypoint.sh"
+      - "scripts/docker-entrypoint_test.sh"
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.md"
       - "licenses/**"
       - "internal/textconv/data/**"
+      - "internal/models/catalog/data/**"
+      - "internal/models/parity/testdata/**"
+      - "internal/models/providers/assets/**"
+      - "scripts/model-catalog/**"
       - "scripts/*license*.sh"
       - "scripts/git-hooks/**"
       - "scripts/test-git-hooks.sh"
@@ -43,11 +51,19 @@ on:
       - "migrations/**"
       - "skills/preloaded/**"
       - "testdata/**"
+      - "website-docs/0*/**"
+      - "website-docs/.vitepress/config.mts"
       - "docker/Dockerfile.app"
+      - "scripts/docker-entrypoint.sh"
+      - "scripts/docker-entrypoint_test.sh"
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.md"
       - "licenses/**"
       - "internal/textconv/data/**"
+      - "internal/models/catalog/data/**"
+      - "internal/models/parity/testdata/**"
+      - "internal/models/providers/assets/**"
+      - "scripts/model-catalog/**"
       - "scripts/*license*.sh"
       - "scripts/git-hooks/**"
       - "scripts/test-git-hooks.sh"
@@ -66,7 +82,7 @@ env:
   GO_VERSION: "1.26"
   GOPROXY: https://proxy.golang.org,direct
   # Keep tests independent of a developer machine's custom log template.
-  LOG_FORMAT: ""
+  WEKNORA_LOG_FORMAT: ""
   BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
 
 jobs:
@@ -88,6 +104,8 @@ jobs:
       - name: Download modules
         run: go mod download
 
+      - name: Test Docker entrypoint permissions
+        run: bash scripts/docker-entrypoint_test.sh
       - name: Verify third-party notices and source bundle
         run: |
           bash ./scripts/check-license-bundle.sh
@@ -117,6 +135,9 @@ jobs:
             exit 1
           fi
 
+      - name: Verify generated model catalog
+        run: python3 scripts/model-catalog/generate.py --check
+
       - name: Verify Git hook test coverage
         run: bash ./scripts/test-git-hooks.sh
 
@@ -126,6 +147,7 @@ jobs:
           mapfile -t pkgs < <(go list ./... | grep -v '/docreader/')
           go vet "${pkgs[@]}"
           go test "${pkgs[@]}"
+          go test -tags desktop ./internal/container
 
       - name: Build server
         run: go build ./cmd/server

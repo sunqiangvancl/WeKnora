@@ -41,7 +41,7 @@ func TestInstallerAgentGetsTheRootShellWithTheSkillsRoot(t *testing.T) {
 	config.EnableSkillInstallMode(types.BuiltinSkillInstallerID, sandbox.SkillsImageRoot+"/pptx")
 	registry := tools.NewToolRegistry()
 
-	(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, config)
+	(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, config, tools.HostApprovals{})
 
 	result, err := registry.ExecuteTool(installShellToolContext(), tools.ToolShellExec,
 		json.RawMessage(`{"command":"pip install -r requirements.txt","work_dir":"`+
@@ -58,7 +58,7 @@ func TestInstallerAgentGetsTheRootShellWithTheSkillsRoot(t *testing.T) {
 }
 
 func TestOrdinaryAgentUsesSessionShellForSandboxPaths(t *testing.T) {
-	for _, workDir := range []string{"", "/tmp/task/previews", sandbox.SkillsImageRoot + "/sk-1"} {
+	for _, workDir := range []string{"", sandbox.SessionWorkspaceRoot, sandbox.SessionWorkspaceRoot + "/scratch"} {
 		t.Run(workDir, func(t *testing.T) {
 			installer := &stubInstallShellExecutor{}
 			ordinary := &stubShellExecutor{}
@@ -68,7 +68,9 @@ func TestOrdinaryAgentUsesSessionShellForSandboxPaths(t *testing.T) {
 				installShell: installer,
 			}
 			registry := tools.NewToolRegistry()
-			(&agentService{}).registerSandboxShellTool(context.Background(), registry, mgr, &types.AgentConfig{})
+			(&agentService{}).registerSandboxShellTool(
+				context.Background(), registry, mgr, &types.AgentConfig{}, tools.HostApprovals{},
+			)
 
 			args, err := json.Marshal(tools.ShellExecInput{Command: "ls", WorkDir: workDir})
 			require.NoError(t, err)

@@ -1,10 +1,13 @@
 package notion
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,15 +352,40 @@ func TestClientQueryDatabaseAll(t *testing.T) {
 var _ = time.Now
 
 func TestDownloadFile_RejectsLoopbackURL(t *testing.T) {
+	const apiHost = "notion.example"
+	// Permit client setup without DNS while leaving the attachment host blocked.
+	t.Setenv("SSRF_WHITELIST", apiHost)
 	secutils.ResetSSRFWhitelistForTest()
 	t.Cleanup(secutils.ResetSSRFWhitelistForTest)
 
-	client, err := newClient("test-token", "https://api.notion.com")
+	client, err := newClient("test-token", "https://"+apiHost)
 	if err != nil {
 		t.Fatalf("newClient: %v", err)
 	}
 	_, err = client.DownloadFile(context.Background(), "http://127.0.0.1/secret")
+	if err == nil || !strings.HasPrefix(err.Error(), "attachment URL rejected:") {
+		t.Fatalf("expected SSRF validation to reject the loopback attachment URL, got %v", err)
+	}
+}
+
+func TestDoRequest_RejectsOversizedResponse(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 1<<20+1))
+	}))
+	defer server.Close()
+
+	c := mustTestClient(t, "token", server.URL)
+	c.jsonLimit = 1 << 20
+	_, err := c.doRequest(context.Background(), http.MethodGet, "/v1/users/me", nil)
 	if err == nil {
-		t.Fatal("expected loopback attachment URL to be rejected")
+		t.Fatal("doRequest accepted a response larger than the cap, want error")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("error = %v, want an explicit over-limit error", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("server hit %d times, want 1 (oversized responses must not be retried)", got)
 	}
 }

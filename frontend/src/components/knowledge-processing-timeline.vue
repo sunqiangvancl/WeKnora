@@ -2,15 +2,18 @@
 import { ref, reactive, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
+import AssistantActionButton from '@/components/assistant/AssistantActionButton.vue'
 import { copyWithToast } from '@/utils/clipboard'
 import { getKnowledgeSpans, reparseKnowledge, cancelKnowledgeParse, getKnowledgeDetails } from '@/api/knowledge-base/index'
 import {
   groupPostprocessGraphSpans,
   knowledgeSpansPayloadHasTrace,
+  postprocessElapsedMs,
   summarizePostprocessTasks,
   type KnowledgeTraceNode,
 } from '@/utils/knowledgeTrace'
-import { resolveTimelineHeaderStatus } from '@/utils/knowledgeProcessingStatus'
+import { resolveTimelineHeaderStatus, shouldShowProcessingError } from '@/utils/knowledgeProcessingStatus'
+import { shownStall, stalledMinutes, STALLED_POLL_INTERVAL_MS } from '@/utils/knowledgeProcessingStall'
 import { axisGridStepPct, buildAxisTicks, computeTraceAxis } from '@/utils/traceAxis'
 import type { KnowledgeProcessOverrides } from '@/types/knowledgeProcess'
 
@@ -32,6 +35,10 @@ interface SpansResponse {
   current_stage?: string
   trace: SpanNode
   last_error?: LastError | null
+  // Latest row or span write; only sent while the parse is in flight.
+  last_activity_at?: string
+  // Server verdict once quiet past the stall hint: 'queued' or 'stalled'.
+  stall_state?: string
 }
 
 // IMPORTANT: Vue 3 coerces missing Boolean props to `false`, NOT
@@ -150,6 +157,21 @@ let unmounted = false
 // network black hole), the worst case is one stuck request blocking
 // retries until axios timeout (30s); the loop itself stays alive.
 let fetchInFlight = false
+// A document switch must bypass the previous read's overlap gate. Track
+// visits as well as IDs so A -> B -> A cannot accept the first A response.
+let documentGeneration = 0
+let spansRequest = 0
+
+function invalidateSpansRequest() {
+  spansRequest += 1
+  fetchInFlight = false
+  loading.value = false
+  refreshing.value = false
+}
+
+function isCurrentDocument(id: string, generation: number): boolean {
+  return !unmounted && id === props.knowledgeId && generation === documentGeneration
+}
 
 const stages = computed<SpanNode[]>(() => {
   const trace = data.value?.trace
@@ -199,9 +221,20 @@ function formatRelativeTime(ts: number): string {
 
 // A skipped stage did not execute. Its tiny bookkeeping interval is not
 // processing time, so do not present it as (for example) multimodal time.
-function formatSpanDuration(node: SpanNode): string {
+function formatSpanDuration(node: SpanNode, includeChildren = false): string {
   if (node.status === 'skipped' || node.status === 'pending') return '—'
+  if (includeChildren) {
+    const elapsed = postprocessElapsedMs(node, postprocessDisplayNow())
+    if (elapsed !== null) return formatDuration(elapsed)
+  }
   return formatDuration(node.duration_ms)
+}
+
+// A terminal parse can leave a stale running child in the last response.
+// Once polling stops, freeze its displayed elapsed time at that response
+// rather than counting indefinitely without fresh worker evidence.
+function postprocessDisplayNow(): number {
+  return shouldPollNow() ? nowTick.value : (lastFetchedAt.value || nowTick.value)
 }
 
 function isPolling(status?: string): boolean {
@@ -343,14 +376,19 @@ function shouldPollNow(): boolean {
 }
 
 async function fetchSpans(opts: { manual?: boolean } = {}) {
-  if (!props.knowledgeId) return
+  if (unmounted || !props.knowledgeId) return
   if (fetchInFlight) return
+  const id = props.knowledgeId
+  const generation = documentGeneration
+  const request = ++spansRequest
+  const isCurrent = () => isCurrentDocument(id, generation) && request === spansRequest
   fetchInFlight = true
   if (opts.manual) refreshing.value = true
   if (!data.value) loading.value = true
   let attemptOk = false
   try {
-    const res: any = await getKnowledgeSpans(props.knowledgeId, selectedAttempt.value)
+    const res: any = await getKnowledgeSpans(id, selectedAttempt.value)
+    if (!isCurrent()) return
     if (res?.success && res.data) {
       data.value = res.data as SpansResponse
       attemptOk = true
@@ -392,11 +430,14 @@ async function fetchSpans(opts: { manual?: boolean } = {}) {
       emit('update:hasSpans', knowledgeSpansPayloadHasTrace(data.value))
       // flatRows is derived from data.value; wait for it to recompute
       // before picking a row out of it.
-      nextTick(autoSelectSpan)
+      nextTick(() => {
+        if (isCurrent()) autoSelectSpan()
+      })
     } else {
       emit('update:hasSpans', false)
     }
   } catch (e) {
+    if (!isCurrent()) return
     // Surface the error in the console — silent failures here is
     // exactly what hid the polling-stalled bug from us before.
     console.warn('[KnowledgeTimeline] fetchSpans failed', e)
@@ -406,26 +447,31 @@ async function fetchSpans(opts: { manual?: boolean } = {}) {
     // failing endpoint would leave "更新于 X 秒前" frozen forever while
     // the spinner spins. Pair with failedAttempts to render a "fetch
     // failed" hint when consecutive errors pile up.
-    lastFetchedAt.value = Date.now()
-    lastFetchOk.value = attemptOk
-    if (attemptOk) {
-      failedAttempts.value = 0
-    } else {
-      failedAttempts.value += 1
+    if (isCurrent()) {
+      lastFetchedAt.value = Date.now()
+      lastFetchOk.value = attemptOk
+      if (attemptOk) {
+        failedAttempts.value = 0
+      } else {
+        failedAttempts.value += 1
+      }
+      loading.value = false
+      refreshing.value = false
+      fetchInFlight = false
     }
-    loading.value = false
-    refreshing.value = false
-    fetchInFlight = false
   }
 }
 
 function ensureAttemptStatuses() {
+  const id = props.knowledgeId
+  const generation = documentGeneration
   const latest = data.value?.latest_attempt || 0
   if (latest <= 1) return
   for (let n = 1; n <= latest; n++) {
     if (attemptStatuses.has(n)) continue
-    getKnowledgeSpans(props.knowledgeId, n)
+    getKnowledgeSpans(id, n)
       .then((res: any) => {
+        if (!isCurrentDocument(id, generation)) return
         if (res?.success && res.data?.trace) {
           attemptStatuses.set(n, resolveTimelineHeaderStatus({
             parseStatus: res.data.parse_status,
@@ -484,6 +530,21 @@ async function onManualRefresh() {
 
 const cancelling = ref(false)
 
+// Minutes the latest attempt has gone without progress; 0 unless it looks
+// stuck. Historical attempts are never "stalled".
+const stalledMin = computed<number>(() => {
+  const d = data.value
+  if (!d || d.attempt !== (d.latest_attempt || d.attempt)) return 0
+  return stalledMinutes(d, nowTick.value)
+})
+
+const stalledStageLabel = computed(() => {
+  const stage = data.value?.current_stage
+  return stage && (STAGES as readonly string[]).includes(stage)
+    ? t(`knowledgeStages.stage.${stage}`)
+    : ''
+})
+
 // Mirrors the backend CancelKnowledgeParse gate (pending / processing /
 // finalizing). Uses the freshest status we have: live span data first,
 // the parent's hint before the first fetch lands.
@@ -510,6 +571,7 @@ async function onCancelParseConfirm() {
 
 function onAttemptChange(n: number) {
   if (Number.isNaN(n)) return
+  invalidateSpansRequest()
   selectedAttempt.value = n
   selectedSpanId.value = null
   autoSelectPending.value = true
@@ -523,6 +585,11 @@ function onAttemptChange(n: number) {
 watch(
   () => props.knowledgeId,
   () => {
+    documentGeneration += 1
+    invalidateSpansRequest()
+    lastFetchedAt.value = 0
+    lastFetchOk.value = true
+    failedAttempts.value = 0
     selectedAttempt.value = undefined
     data.value = null
     processOverrides.value = null
@@ -532,9 +599,11 @@ watch(
     autoSelectPending.value = true
     attemptStatuses.clear()
     userToggledRows.value = new Set()
+    emit('update:hasSpans', false)
     fetchSpans()
     fetchProcessOverrides()
   },
+  { flush: 'sync' },
 )
 
 function onKeydown(ev: KeyboardEvent) {
@@ -544,9 +613,12 @@ function onKeydown(ev: KeyboardEvent) {
 }
 
 async function fetchProcessOverrides() {
-  if (props.compact || !props.knowledgeId) return
+  if (unmounted || props.compact || !props.knowledgeId) return
+  const id = props.knowledgeId
+  const generation = documentGeneration
   try {
-    const res: any = await getKnowledgeDetails(props.knowledgeId)
+    const res: any = await getKnowledgeDetails(id)
+    if (!isCurrentDocument(id, generation)) return
     if (res?.success && res.data) {
       processOverrides.value = res.data.metadata?.process_overrides ?? null
       currentKnowledgeFileType.value = normalizeFileType(
@@ -554,6 +626,7 @@ async function fetchProcessOverrides() {
       )
     }
   } catch {
+    if (!isCurrentDocument(id, generation)) return
     processOverrides.value = null
     currentKnowledgeFileType.value = ''
   }
@@ -572,6 +645,8 @@ onMounted(() => {
       if (unmounted) return
       if (fetchInFlight) return
       if (!shouldPollNow()) return
+      // Nothing is moving on a stalled trace; check back less often.
+      if (stalledMin.value > 0 && Date.now() - lastFetchedAt.value < STALLED_POLL_INTERVAL_MS) return
       fetchSpans()
     }, POLL_INTERVAL_MS)
   }
@@ -583,6 +658,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   unmounted = true
+  invalidateSpansRequest()
   if (pollTimer) {
     clearInterval(pollTimer)
     pollTimer = null
@@ -1215,7 +1291,7 @@ const headerStatusTheme = computed(() => {
 })
 
 const showLastError = computed(() =>
-  Boolean(data.value?.last_error && data.value?.parse_status === 'failed'),
+  shouldShowProcessingError(Boolean(data.value?.last_error), data.value?.parse_status, data.value?.trace?.status),
 )
 
 const failedStage = computed<SpanNode | null>(
@@ -1322,6 +1398,16 @@ const headStats = computed<HeadStat[]>(() => {
       label: t('knowledgeStages.stat.attempt'),
       value: `#${data.value.current_attempt}`,
       mono: true,
+    })
+  }
+  const lastActivity = parseTime(data.value.last_activity_at)
+  if (lastActivity !== null && isLive.value) {
+    out.push({
+      key: 'progress',
+      label: t('knowledgeStages.head.lastProgress'),
+      value: formatRelativeTime(lastActivity),
+      mono: false,
+      note: stalledMin.value > 0,
     })
   }
   if (lastFetchedAt.value && isLive.value) {
@@ -1615,6 +1701,40 @@ const processConfigLines = computed<string[]>(() => {
             </button>
           </div>
 
+          <div v-if="shownStall(data?.stall_state, stalledMin) === 'queued'" class="kp-stall kp-stall-queued"
+            role="status">
+            <t-icon name="time" size="16px" class="kp-stall-icon" />
+            <div class="kp-stall-body">
+              <div class="kp-stall-title">{{ t('knowledgeStages.stall.queuedTitle', { minutes: stalledMin }) }}</div>
+              <div class="kp-stall-hint">{{ t('knowledgeStages.stall.queuedHint') }}</div>
+            </div>
+          </div>
+          <div v-else-if="shownStall(data?.stall_state, stalledMin) === 'stalled'" class="kp-stall" role="status">
+            <t-icon name="time" size="16px" class="kp-stall-icon" />
+            <div class="kp-stall-body">
+              <div class="kp-stall-title">{{ t('knowledgeStages.stall.title', { minutes: stalledMin }) }}</div>
+              <div class="kp-stall-hint">
+                {{ stalledStageLabel
+                  ? t('knowledgeStages.stall.hintAtStage', { stage: stalledStageLabel })
+                  : t('knowledgeStages.stall.hint') }}
+              </div>
+            </div>
+            <t-popconfirm
+              v-if="canCancelParse"
+              theme="warning"
+              :content="t('knowledgeBase.cancelParseConfirmBody', { title: props.docTitle || props.knowledgeId })"
+              :confirm-btn="{ content: t('knowledgeBase.cancelParse'), theme: 'danger' }"
+              :cancel-btn="{ content: t('common.cancel') }"
+              placement="bottom"
+              @confirm="onCancelParseConfirm"
+            >
+              <button type="button" class="kp-stall-btn" :disabled="cancelling" @click.stop>
+                <t-icon :name="cancelling ? 'loading' : 'close-circle'" size="14px" />
+                <span>{{ t('knowledgeBase.cancelParse') }}</span>
+              </button>
+            </t-popconfirm>
+          </div>
+
           <div v-if="showLastError && data?.last_error" class="kp-last-error" role="alert">
             <div class="kp-err-top">
               <span class="kp-err-glyph" aria-hidden="true">!</span>
@@ -1630,7 +1750,10 @@ const processConfigLines = computed<string[]>(() => {
               {{ localizedErrorSuggestion(data.last_error.error_code) }}
             </div>
             <div class="kp-err-actions">
-              <button type="button" class="kp-err-btn" @click="onRetry">
+              <AssistantActionButton :label="t('assistant.actions.diagnose')"
+                :query="t('assistant.prompts.documentFailure', { title: docTitle || knowledgeId, id: knowledgeId })"
+                :selection="{ field: errorHeadline, text: [data.last_error.error_code, data.last_error.error_message].filter(Boolean).join('\n') }" />
+              <button v-if="data.parse_status === 'failed'" type="button" class="kp-err-btn" @click="onRetry">
                 <t-icon name="refresh" size="14px" />
                 <span>{{ t('knowledgeStages.retry') }}</span>
               </button>
@@ -1701,7 +1824,10 @@ const processConfigLines = computed<string[]>(() => {
                     <span class="kp-running-time">{{ formatDuration(liveElapsedMs(row.node)) }}</span>
                   </template>
                   <template v-else>
-                    {{ formatSpanDuration(row.node) }}
+                    <span :title="postprocessElapsedMs(row.node, postprocessDisplayNow()) !== null
+                      ? t('knowledgeStages.detail.includingChildren') : undefined">
+                      {{ formatSpanDuration(row.node, true) }}
+                    </span>
                   </template>
                 </div>
 
@@ -1822,6 +1948,12 @@ const processConfigLines = computed<string[]>(() => {
                         <template v-else>
                           {{ formatSpanDuration(selectedRow.node) }}
                         </template>
+                      </span>
+                    </div>
+                    <div v-if="postprocessElapsedMs(selectedRow.node, postprocessDisplayNow()) !== null" class="kp-kv-row">
+                      <span class="kp-kv-key">{{ t('knowledgeStages.detail.includingChildren') }}</span>
+                      <span class="kp-kv-val kp-mono">
+                        {{ formatDuration(postprocessElapsedMs(selectedRow.node, postprocessDisplayNow()) ?? 0) }}
                       </span>
                     </div>
                     <div v-if="!selectedRow.isRoot && barOffsetMs(selectedRow.node) > 0" class="kp-kv-row">
@@ -2971,6 +3103,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-err-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-top: 10px;
 }
@@ -2996,6 +3129,82 @@ const processConfigLines = computed<string[]>(() => {
 .kp-err-btn:hover {
   background: var(--td-error-color);
   color: var(--td-text-color-anti);
+}
+
+/* Same card shape as .kp-last-error in the warning tone: the run may still
+   finish, so this nudges rather than alarms. */
+.kp-stall {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--td-warning-color-light);
+  border: 1px solid var(--td-warning-color-3);
+  border-left: 3px solid var(--td-warning-color);
+  border-radius: var(--td-radius-medium);
+}
+
+/* Backlogged, not stuck: neutral tone, and no stop button to invite
+   cancelling work that will still finish. */
+.kp-stall-queued {
+  background: var(--td-bg-color-secondarycontainer);
+  border-color: var(--td-component-border);
+  border-left-color: var(--td-text-color-placeholder);
+}
+
+.kp-stall-queued .kp-stall-icon {
+  color: var(--td-text-color-secondary);
+}
+
+.kp-stall-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--td-warning-color);
+}
+
+.kp-stall-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.kp-stall-title {
+  font-size: var(--app-text-sm);
+  font-weight: 600;
+  color: var(--td-text-color-primary);
+}
+
+.kp-stall-hint {
+  margin-top: 4px;
+  font-size: var(--app-text-sm);
+  line-height: 1.5;
+  color: var(--td-text-color-secondary);
+}
+
+.kp-stall-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--td-warning-color);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+  color: var(--td-warning-color-7);
+  font-size: var(--app-text-sm);
+  cursor: pointer;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
+}
+
+.kp-stall-btn:hover:not(:disabled) {
+  background: var(--td-warning-color);
+  color: var(--td-text-color-anti);
+}
+
+.kp-stall-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* ============== DETAIL PANEL ==============

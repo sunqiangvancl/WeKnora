@@ -183,9 +183,10 @@ func matchesKnowledgeListDelete(taskType string, payload []byte, knowledgeID str
 
 // HasQueuedTasksForKnowledge reports whether any pending / scheduled /
 // retry / active task referencing knowledgeID still lives in the queue.
-// Read-only counterpart of CancelTasksForKnowledge — the housekeeping
-// sweep uses it to avoid flagging a backlogged-but-not-orphaned row as
-// failed. Short-circuits on the first match and never deletes anything.
+// Read-only counterpart of CancelTasksForKnowledge. Short-circuits on the
+// first match and never deletes anything, but each call pages through the
+// queues from the start: to check many documents (e.g. the housekeeping
+// sweep), use QueuedKnowledgeIDs instead.
 func (a *asynqTaskInspector) HasQueuedTasksForKnowledge(
 	ctx context.Context, knowledgeID string,
 ) (bool, error) {
@@ -203,6 +204,41 @@ func (a *asynqTaskInspector) HasQueuedTasksForKnowledge(
 		}
 	}
 	return false, nil
+}
+
+// QueuedKnowledgeIDs scans every cancellable state of every queue once and
+// collects the knowledge IDs its tasks reference.
+func (a *asynqTaskInspector) QueuedKnowledgeIDs(_ context.Context) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	if a == nil || a.inspector == nil {
+		return out, nil
+	}
+	for _, queue := range queuesScanned {
+		for _, state := range a.cancellableTaskStates() {
+			for page := 1; ; page++ {
+				tasks, err := state.list(queue, asynq.PageSize(listPageSize), asynq.Page(page))
+				if err != nil {
+					if isAsynqQueueNotFound(err) {
+						break
+					}
+					return nil, fmt.Errorf("list %s tasks in queue %s: %w", state.name, queue, err)
+				}
+				for _, task := range tasks {
+					if _, ok := taskTypesForKnowledgeCancel[task.Type]; !ok {
+						continue
+					}
+					var probe knowledgeIDProbe
+					if json.Unmarshal(task.Payload, &probe) == nil && probe.KnowledgeID != "" {
+						out[probe.KnowledgeID] = struct{}{}
+					}
+				}
+				if len(tasks) < listPageSize {
+					break
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // HasQueuedDeleteTasksForKnowledge is the delete-task counterpart of
@@ -1124,6 +1160,11 @@ func (noopTaskInspector) HasQueuedTasksForKnowledge(
 	ctx context.Context, knowledgeID string,
 ) (bool, error) {
 	return false, nil
+}
+
+// QueuedKnowledgeIDs is empty in Lite mode: inline executors never queue.
+func (noopTaskInspector) QueuedKnowledgeIDs(context.Context) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
 }
 
 // HasQueuedDeleteTasksForKnowledge always reports false in Lite mode:

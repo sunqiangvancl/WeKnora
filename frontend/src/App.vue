@@ -20,6 +20,7 @@ import zhCNConfig from 'tdesign-vue-next/esm/locale/zh_CN'
 import koKRConfig from 'tdesign-vue-next/esm/locale/ko_KR'
 import jaJPConfig from 'tdesign-vue-next/esm/locale/ja_JP'
 import ruRUConfig from 'tdesign-vue-next/esm/locale/ru_RU'
+import zhTWConfig from 'tdesign-vue-next/esm/locale/zh_TW'
 
 const { locale, t, tm } = useI18n()
 const { formatRole, roleIcon } = useRoleLabel()
@@ -30,6 +31,7 @@ const settingsStore = useSettingsStore()
 const tdLocaleMap: Record<string, object> = {
   'en-US': enUSConfig,
   'zh-CN': zhCNConfig,
+  'zh-TW': zhTWConfig,
   'ko-KR': koKRConfig,
   'ja-JP': jaJPConfig,
   'ru-RU': ruRUConfig,
@@ -46,7 +48,7 @@ const decodeOIDCResult = (encoded: string) => {
 }
 
 const clearOIDCCallbackState = (path = '/') => {
-  window.history.replaceState({}, document.title, path)
+  window.history.replaceState(window.history.state, document.title, router.resolve(path).href)
 }
 
 const syncOIDCUserContext = async () => {

@@ -48,9 +48,53 @@ func TestDataSourceResponse_OmitsCredentials(t *testing.T) {
 	assert.Contains(t, s, "main")
 }
 
+func TestDataSourceResponses_OmitsLastSyncCursor(t *testing.T) {
+	ds := &types.DataSource{
+		ID:             "ds-1",
+		Name:           "github-prod",
+		Type:           "github",
+		LastSyncCursor: types.JSON(`{"page":42}`),
+		LastSyncResult: types.JSON(`{"total":10}`),
+	}
+
+	list := NewDataSourceResponses([]*types.DataSource{ds})
+	assert.Len(t, list, 1)
+	got := list[0]
+	assert.Empty(t, got.LastSyncCursor)
+
+	body, err := json.Marshal(got)
+	assert.NoError(t, err)
+	var raw map[string]json.RawMessage
+	assert.NoError(t, json.Unmarshal(body, &raw))
+	assert.NotContains(t, raw, "last_sync_cursor")
+
+	// Every other field must match the single-entity conversion.
+	want := NewDataSourceResponse(ds)
+	assert.Equal(t, json.RawMessage(`{"page":42}`), want.LastSyncCursor)
+	want.LastSyncCursor = nil
+	assert.Equal(t, want, got)
+}
+
 func TestDataSourceResponse_NilSafe(t *testing.T) {
 	assert.Nil(t, NewDataSourceResponse(nil))
 	assert.Equal(t, []*DataSourceResponse{}, NewDataSourceResponses(nil))
+}
+
+func TestNextcloudResponseOmitsAppPassword(t *testing.T) {
+	cfg := types.DataSourceConfig{Type: types.ConnectorTypeNextcloud, Credentials: map[string]any{
+		"base_url": "https://nextcloud.example.com", "username": "alice", "app_password": "app-password-for-tests",
+	}, ResourceIDs: []string{"/docs"}}
+	blob, err := cfg.ToJSON()
+	assert.NoError(t, err)
+	ds := &types.DataSource{ID: "ds-nextcloud", Type: types.ConnectorTypeNextcloud, Config: blob}
+	for _, response := range []any{NewDataSourceResponse(ds), NewDataSourceResponses([]*types.DataSource{ds})} {
+		body, err := json.Marshal(response)
+		assert.NoError(t, err)
+		assert.NotContains(t, string(body), "app_password")
+		assert.NotContains(t, string(body), "app-password-for-tests")
+		assert.NotContains(t, string(body), "nextcloud.example.com")
+		assert.Contains(t, string(body), `"configured":true`)
+	}
 }
 
 func TestDataSourceResponse_RSSFeedURLsFromCredentials(t *testing.T) {

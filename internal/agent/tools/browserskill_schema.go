@@ -11,7 +11,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// Flat argument fields use the paired CLI/extension 0.3.0 source baseline.
+// The model sees one text budget, max_text_chars. browserCallParams maps page
+// reads onto the extension's max_tokens (about 4 characters per token).
 // Session identity is server-owned.
 // Method-specific requirements are also described to the model on each field.
 const browserToolParameters = `{
@@ -20,6 +21,7 @@ const browserToolParameters = `{
     "method": {
       "type": "string",
       "enum": [
+        "cooperate",
         "observe",
         "snapshot",
         "screenshot",
@@ -57,17 +59,68 @@ const browserToolParameters = `{
       "type": "boolean",
       "description": "Keep this task open after the turn for a deliverable or human step. Default false."
     },
+    "action": {
+      "type": "string",
+      "enum": ["sync", "status", "wait"],
+      "description": "Required: sync returns evidence/receipts, status inspects, wait awaits hand-back (max 25000 ms)."
+    },
+    "control_policy": {
+      "type": "string",
+      "enum": ["auto", "target", "strict"],
+      "description": "Sync only: auto selects target for a new session, otherwise keeps its policy."
+    },
+    "context_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Actual context_id from sync. Required for page actions; never invent or silently refresh."
+    },
+    "observation_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Sync's single-use receipt, also required for scripts/navigation/untargeted actions."
+    },
+    "depends_on": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {"type": "string", "minLength": 1},
+      "description": "Strict policy only: refs/selectors for decision regions. Use expect with target policy."
+    },
+    "expect": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Observed facts that must still hold before input. Values are literal, including whitespace.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "target": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "\\S"},
+          "field": {"type": "string", "enum": ["text", "value", "checked", "exists", "attribute"]},
+          "equals": {"type": ["string", "boolean", "null"]},
+          "attribute": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"}
+        },
+        "required": ["target", "field", "equals"],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {"field": {"enum": ["text", "value"]}, "equals": {"type": "string"}},
+            "not": {"required": ["attribute"]}
+          },
+          {
+            "properties": {"field": {"enum": ["checked", "exists"]}, "equals": {"type": "boolean"}},
+            "not": {"required": ["attribute"]}
+          },
+          {
+            "properties": {"field": {"const": "attribute"}, "equals": {"type": ["string", "null"]}},
+            "required": ["attribute"]
+          }
+        ]
+      }
+    },
     "debug_surfaces": {
       "type": "boolean"
     },
     "max_depth": {
       "type": "integer",
       "minimum": 0.0
-    },
-    "max_tokens": {
-      "type": "integer",
-      "minimum": 0.0,
-      "description": "For observe/snapshot: limit the rendered page content."
     },
     "probe_hover": {
       "type": "boolean",
@@ -218,7 +271,9 @@ const browserToolParameters = `{
     },
     "max_text_chars": {
       "type": "integer",
-      "minimum": 1.0
+      "minimum": 1.0,
+      "description": "Maximum characters of text to return. For observe and snapshot this bounds ` +
+	`the rendered page; for console and network it bounds each entry."
     },
     "since": {
       "type": "integer",
@@ -346,71 +401,123 @@ const browserToolParameters = `{
   "required": [
     "method"
   ],
+  "allOf": [
+    {
+      "if": {"properties": {"method": {"const": "cooperate"}}},
+      "then": {"properties": {"timeout_ms": {"maximum": 25000}}}
+    }
+  ],
   "additionalProperties": false
 }`
 
 type browserArgumentRule struct{ fields, required []string }
 
 var browserArgumentRules = map[string]browserArgumentRule{
+	"cooperate": {
+		fields:   []string{"action", "control_policy", "max_text_chars", "tab_id", "timeout_ms"},
+		required: []string{"action"},
+	},
 	"screenshot": {fields: []string{"ref", "tab_id"}},
 	"observe": {
-		fields:   []string{"debug_surfaces", "max_depth", "max_tokens", "probe_hover", "tab_id"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"debug_surfaces", "max_depth", "max_text_chars", "probe_hover", "tab_id",
+		},
 		required: []string{},
 	},
 	"snapshot": {
-		fields:   []string{"max_depth", "max_tokens", "tab_id"},
+		fields:   []string{"max_depth", "max_text_chars", "tab_id"},
 		required: []string{},
 	},
 	"navigate": {
-		fields:   []string{"tab_id", "timeout_ms", "url", "wait_until"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"tab_id", "timeout_ms", "url", "wait_until",
+		},
 		required: []string{"url"},
 	},
 	"navigate_back": {
-		fields:   []string{"tab_id", "timeout_ms", "wait_until"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"tab_id", "timeout_ms", "wait_until",
+		},
 		required: []string{},
 	},
 	"navigate_forward": {
-		fields:   []string{"tab_id", "timeout_ms", "wait_until"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"tab_id", "timeout_ms", "wait_until",
+		},
 		required: []string{},
 	},
 	"reload": {
-		fields:   []string{"hard", "tab_id", "timeout_ms", "wait_until"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"hard", "tab_id", "timeout_ms", "wait_until",
+		},
 		required: []string{},
 	},
 	"click": {
-		fields:   []string{"button", "click_count", "modifiers", "ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"button", "click_count", "modifiers", "ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"fill": {
-		fields:   []string{"clear_before", "ref", "selector", "tab_id", "timeout_ms", "value"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"clear_before", "ref", "selector", "tab_id", "timeout_ms", "value",
+		},
 		required: []string{"value"},
 	},
 	"press": {
-		fields:   []string{"hold_ms", "key", "modifiers", "ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"hold_ms", "key", "modifiers", "ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{"key"},
 	},
 	"hover": {
-		fields:   []string{"modifiers", "ref", "selector", "settle_ms", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"modifiers", "ref", "selector", "settle_ms", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"wheel": {
-		fields:   []string{"delta_x", "delta_y", "modifiers", "ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"delta_x", "delta_y", "modifiers", "ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"scroll_to": {
-		fields:   []string{"ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"focus": {
-		fields:   []string{"ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"blur": {
-		fields:   []string{"ref", "selector", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"ref", "selector", "tab_id", "timeout_ms",
+		},
 		required: []string{},
 	},
 	"select": {
-		fields:   []string{"ref", "selector", "tab_id", "timeout_ms", "values"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"ref", "selector", "tab_id", "timeout_ms", "values",
+		},
 		required: []string{"values"},
 	},
 	"tab_list": {
@@ -426,7 +533,7 @@ var browserArgumentRules = map[string]browserArgumentRule{
 		required: []string{"tab_id"},
 	},
 	"tab_close": {
-		fields:   []string{"tab_id"},
+		fields:   []string{"context_id", "observation_id", "expect", "depends_on", "tab_id"},
 		required: []string{"tab_id"},
 	},
 	"tab_borrow": {
@@ -442,7 +549,10 @@ var browserArgumentRules = map[string]browserArgumentRule{
 		required: []string{},
 	},
 	"evaluate": {
-		fields:   []string{"await_promise", "expression", "return_by_value", "tab_id", "timeout_ms"},
+		fields: []string{
+			"context_id", "observation_id", "expect", "depends_on",
+			"await_promise", "expression", "return_by_value", "tab_id", "timeout_ms",
+		},
 		required: []string{"expression"},
 	},
 	"console": {
@@ -462,11 +572,11 @@ var browserArgumentRules = map[string]browserArgumentRule{
 		required: []string{"duration_ms"},
 	},
 	"window_resize": {
-		fields:   []string{"height", "width"},
+		fields:   []string{"context_id", "observation_id", "expect", "depends_on", "height", "width"},
 		required: []string{"height", "width"},
 	},
 	"emulate": {
-		fields:   []string{"off", "overrides", "tab_id"},
+		fields:   []string{"context_id", "observation_id", "expect", "depends_on", "off", "overrides", "tab_id"},
 		required: []string{},
 	},
 	"request_help": {
@@ -554,5 +664,45 @@ func (t *BrowserSkillTool) ValidateArguments(args json.RawMessage) error {
 			return fmt.Errorf("emulate requires either off:true or overrides")
 		}
 	}
+	if method == "cooperate" {
+		if _, supplied := input["control_policy"]; supplied && input["action"] != "sync" {
+			return fmt.Errorf("cooperate accepts control_policy only with action:sync")
+		}
+	}
 	return nil
+}
+
+// browserCallParams copies model arguments into the official tool.* parameter
+// names. Page observations budget rendered tokens, so a character cap becomes
+// max_tokens at the extension's 4-characters-per-token heuristic. Console and
+// network already speak max_text_chars and are passed through.
+func browserCallParams(method string, input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for name, value := range input {
+		if name == "method" || name == "keep_open" {
+			continue
+		}
+		out[name] = value
+	}
+	switch method {
+	case "observe", "snapshot", "cooperate":
+		chars, ok := out["max_text_chars"]
+		if !ok {
+			break
+		}
+		delete(out, "max_text_chars")
+		out["max_tokens"] = observationTokensFromTextChars(chars)
+	}
+	return out
+}
+
+// observationTokensFromTextChars matches the extension heuristic of about four
+// characters per rendered token, rounding up so the page cap is not shorter
+// than the character budget the model asked for.
+func observationTokensFromTextChars(value any) int {
+	chars := int(toFloat64(value))
+	if chars < 1 {
+		return 1
+	}
+	return (chars + 3) / 4
 }

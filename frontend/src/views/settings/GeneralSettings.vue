@@ -20,6 +20,7 @@
             style="width: 280px;"
           >
             <t-option value="zh-CN" :label="$t('language.zhCN')">{{ $t('language.zhCN') }}</t-option>
+            <t-option value="zh-TW" :label="$t('language.zhTW')">{{ $t('language.zhTW') }}</t-option>
             <t-option value="en-US" :label="$t('language.enUS')">{{ $t('language.enUS') }}</t-option>
             <t-option value="ru-RU" :label="$t('language.ruRU')">{{ $t('language.ruRU') }}</t-option>
             <t-option value="ko-KR" :label="$t('language.koKR')">{{ $t('language.koKR') }}</t-option>
@@ -122,6 +123,8 @@
         </div>
       </div>
 
+      <HostApprovalDefaultSetting v-if="authStore.isLiteMode" />
+
       <!-- 自动下载更新开关 (Lite edition only) -->
       <div class="setting-row" v-if="authStore.isLiteMode">
         <div class="setting-info">
@@ -145,6 +148,7 @@ import { useI18n } from 'vue-i18n'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useTheme, type ThemeMode } from '@/composables/useTheme'
+import HostApprovalDefaultSetting from './components/HostApprovalDefaultSetting.vue'
 import {
   useFont,
   SANS_STACKS,

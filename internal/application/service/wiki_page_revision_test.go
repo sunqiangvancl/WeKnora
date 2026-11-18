@@ -23,13 +23,14 @@ func newWikiRevisionTestService(t *testing.T) (context.Context, wikiRevisionTest
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
 	repo := repository.NewWikiPageRepository(db)
-	svc := NewWikiPageService(repo, nil, nil, nil, nil)
+	svc := NewWikiPageService(repo, nil, nil, nil, nil, nil)
 	return context.Background(), wikiRevisionTestHarness{svc: svc}, db
 }
 
 func TestUpdateWikiPageSnapshotsSupersededVersion(t *testing.T) {
-	ctx, h, _ := newWikiRevisionTestService(t)
+	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-rev"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	created, err := h.svc.CreatePage(types.WithWikiEditSource(ctx, types.WikiEditSourceUser), &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "concept/rag",
@@ -74,8 +75,9 @@ func TestUpdateWikiPageSnapshotsSupersededVersion(t *testing.T) {
 }
 
 func TestUpdateWikiPagePersistsClearedFields(t *testing.T) {
-	ctx, h, _ := newWikiRevisionTestService(t)
+	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-clear"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	created, err := h.svc.CreatePage(ctx, &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "concept/x",
@@ -101,8 +103,9 @@ func TestUpdateWikiPagePersistsClearedFields(t *testing.T) {
 }
 
 func TestRevertWikiPageToVersion(t *testing.T) {
-	ctx, h, _ := newWikiRevisionTestService(t)
+	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-revert"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	created, err := h.svc.CreatePage(ctx, &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "entity/acme",
@@ -142,6 +145,7 @@ func TestRevertWikiPageToVersion(t *testing.T) {
 func TestWikiPageRevisionsArePruned(t *testing.T) {
 	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-prune-rev"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	page, err := h.svc.CreatePage(ctx, &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "concept/hot",
@@ -172,8 +176,9 @@ func TestWikiPageRevisionsArePruned(t *testing.T) {
 // A page the pipeline rewrites constantly must not lose the handful of human
 // edits that motivated keeping history in the first place.
 func TestPipelineChurnDoesNotEvictHumanRevisions(t *testing.T) {
-	ctx, h, _ := newWikiRevisionTestService(t)
+	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-mixed-rev"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	page, err := h.svc.CreatePage(types.WithWikiEditSource(ctx, types.WikiEditSourceUser), &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "concept/hub",
@@ -209,6 +214,7 @@ func TestPipelineChurnDoesNotEvictHumanRevisions(t *testing.T) {
 func TestDeletePageDropsRevisionHistory(t *testing.T) {
 	ctx, h, db := newWikiRevisionTestService(t)
 	const kb = "kb-del-rev"
+	seedWikiTestKnowledgeBase(t, db, kb, 1)
 
 	page, err := h.svc.CreatePage(ctx, &types.WikiPage{
 		KnowledgeBaseID: kb, TenantID: 1, Slug: "concept/doomed",

@@ -69,6 +69,14 @@
           <div v-if="entity.parameters?.proxy_url" class="provider-card__url" :title="entity.parameters.proxy_url">
             {{ entity.parameters.proxy_url }}
           </div>
+          <div v-if="clientsOf(entity.provider)" class="provider-card__clients">
+            <t-tag size="small" variant="light">
+              {{ t('webSearchSettings.clients.search') }} · {{ readerLabel(clientsOf(entity.provider)!.search) }}
+            </t-tag>
+            <t-tag size="small" variant="light">
+              {{ t('webSearchSettings.clients.fetch') }} · {{ readerLabel(clientsOf(entity.provider)!.fetch) }}
+            </t-tag>
+          </div>
         </div>
       </div>
       <button
@@ -183,6 +191,21 @@
               -->
               <t-option v-for="pt in providerTypes" :key="pt.id" :value="pt.id" :label="pt.name" />
             </t-select>
+          </div>
+
+          <div v-if="selectedClients" class="form-item">
+            <label class="form-label">{{ t('webSearchSettings.clients.label') }}</label>
+            <dl class="client-list">
+              <div class="client-list__row">
+                <dt>{{ t('webSearchSettings.clients.search') }}</dt>
+                <dd>{{ readerLabel(selectedClients.search) }}</dd>
+              </div>
+              <div class="client-list__row">
+                <dt>{{ t('webSearchSettings.clients.fetch') }}</dt>
+                <dd>{{ readerLabel(selectedClients.fetch) }}</dd>
+              </div>
+            </dl>
+            <p class="form-desc">{{ t('webSearchSettings.clients.help') }}</p>
           </div>
 
           <div class="form-item">
@@ -308,11 +331,11 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
+import { useAssistantDataChange } from '@/utils/assistantDataChange'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
 import { AddIcon } from 'tdesign-icons-vue-next'
 import {
-  listWebSearchProviders,
   listWebSearchProviderTypes,
   createWebSearchProvider,
   updateWebSearchProvider,
@@ -331,10 +354,12 @@ import CredentialResource, {
 } from '@/components/credentials/CredentialResource.vue'
 import { useConfirmDelete } from '@/components/settings/useConfirmDelete'
 import { useAuthStore } from '@/stores/auth'
+import { useChatResourcesStore } from '@/stores/chatResources'
 import { providerLogo } from './providerLogos'
 
 const { t } = useI18n()
 const authStore = useAuthStore()
+const chatResources = useChatResourcesStore()
 const confirmDelete = useConfirmDelete()
 
 // ===== State =====
@@ -392,6 +417,8 @@ watch(
 const selectedProviderType = computed(() => {
   return providerTypes.value.find(pt => pt.id === providerForm.value.provider)
 })
+
+const selectedClients = computed(() => selectedProviderType.value?.clients)
 
 // Create-mode placeholder (edit mode replaces the input with
 // <CredentialResource>, which has its own placeholder).
@@ -485,6 +512,17 @@ const providerTypeLabel = (providerId: string) => {
   return providerTypes.value.find(p => p.id === providerId)?.name || providerId
 }
 
+const clientsOf = (providerId: string) => {
+  return providerTypes.value.find(p => p.id === providerId)?.clients
+}
+
+// reader is a provider type id, or 'local' for the built-in page reader.
+const readerLabel = (reader: string) => {
+  return reader === 'local'
+    ? t('webSearchSettings.clients.local')
+    : t('webSearchSettings.clients.viaApi', { name: providerTypeLabel(reader) })
+}
+
 const configFieldText = (key: string | undefined, fallback: string) => {
   return key ? t(key, fallback) : fallback
 }
@@ -506,12 +544,12 @@ const onProviderTypeChange = () => {
   lastTestOk.value = null
 }
 
+// 走 chatResources 的共享快照并强刷：增删改之后对话输入栏读到的就是最新列表，
+// 不需要它再监听设置弹窗关闭去重拉。
 const loadProviderEntities = async () => {
   try {
-    const response = await listWebSearchProviders()
-    if (response.data && Array.isArray(response.data)) {
-      providerEntities.value = response.data
-    }
+    await chatResources.ensureWebSearchProviders(true)
+    providerEntities.value = chatResources.webSearchProviders
   } catch (error) {
     console.error('Failed to load provider entities:', error)
   }
@@ -708,6 +746,8 @@ const handleMenuAction = (data: { value: string }, entity: WebSearchProviderEnti
 }
 
 // ===== Init =====
+useAssistantDataChange(() => { void loadProviderEntities() }, { areas: ['web_search_provider'] })
+
 onMounted(async () => {
   await Promise.all([loadProviderTypes(), loadProviderEntities()])
 })
@@ -829,6 +869,9 @@ onMounted(async () => {
 .provider-card--zhipu .provider-card__badge {
   .provider-card-badge-color(#2563eb);
 }
+.provider-card--deepseek .provider-card__badge {
+  .provider-card-badge-color(#4D6BFE);
+}
 
 .provider-card__body {
   .provider-card-body();
@@ -880,6 +923,43 @@ onMounted(async () => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.provider-card__clients {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.client-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--app-radius-md);
+  background: var(--td-bg-color-secondarycontainer);
+
+  &__row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    font-size: var(--app-text-sm);
+    line-height: 1.5;
+
+    dt {
+      flex-shrink: 0;
+      width: 72px;
+      color: var(--td-text-color-secondary);
+    }
+
+    dd {
+      margin: 0;
+      min-width: 0;
+      color: var(--td-text-color-primary);
+    }
+  }
 }
 
 .empty-state {
@@ -1077,5 +1157,9 @@ onMounted(async () => {
 .websearch-drawer--zhipu .setting-drawer__header-icon {
   background: rgba(37, 99, 235, 0.12);
   color: #2563EB;
+}
+.websearch-drawer--deepseek .setting-drawer__header-icon {
+  background: rgba(77, 107, 254, 0.12);
+  color: #4D6BFE;
 }
 </style>

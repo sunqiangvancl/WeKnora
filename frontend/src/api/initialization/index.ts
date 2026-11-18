@@ -1,6 +1,7 @@
 import { get, post, put } from '../../utils/request';
+import { getApiBaseUrl } from '../../utils/api-base';
 import i18n from '@/i18n'
-import type { ModelCapabilities, ReasoningEffortLevel } from '../model'
+import type { ModelCapabilities, ModelSpecOverride, ReasoningEffortLevel } from '../model'
 
 const t = (key: string) => i18n.global.t(key)
 
@@ -158,6 +159,7 @@ export interface KBModelConfigRequest {
         customInstructions?: string
     }
     questionGeneration?: {
+        modelId?: string
         enabled: boolean
         questionCount: number
         customInstructions?: string
@@ -305,6 +307,7 @@ export function getCurrentConfigByKB(kbId: string): Promise<InitializationConfig
 // customHeaders / extraConfig / interfaceType 对应后端 ModelTestRequest 里的同名字段，
 // 会被透传给真正的模型装配流程，保证测试连接与生产调用走完全相同的路径。
 interface BaseModelTestPayload {
+    spec?: ModelSpecOverride;
     customHeaders?: Record<string, string>;
     extraConfig?: Record<string, string>;
     interfaceType?: string;
@@ -479,7 +482,7 @@ export function testMultimodalFunction(testData: {
         }
 
         // 使用原生fetch因为需要发送FormData
-        fetch('/api/v1/initialization/multimodal/test', {
+        fetch(`${getApiBaseUrl()}/api/v1/initialization/multimodal/test`, {
             method: 'POST',
             headers,
             body: formData
@@ -690,6 +693,7 @@ export function listModelProviders(modelType?: string): Promise<ModelProviderOpt
 }
 
 export interface ResolveModelCatalogParams {
+    spec?: ModelSpecOverride;
     provider: string;
     model?: string;
     base_url?: string;
@@ -700,7 +704,7 @@ export interface ResolveModelCatalogParams {
     // Vendor-declared non-secret extra fields (Azure api_version, ...) are
     // forwarded by key so the preview resolves the same request the runtime
     // will make. The backend only accepts keys the vendor declares.
-    [extraField: string]: string | undefined;
+    [extraField: string]: string | ModelSpecOverride | undefined;
 }
 
 // 目录解析结果。Mirrors handler.ResolveModelCatalog response data.
@@ -722,14 +726,8 @@ export interface ResolvedModelCatalog {
 
 // 解析模型的有效接入配置（协议、思考等级、上下文窗口等），供编辑器实时展示。
 export function resolveModelCatalog(params: ResolveModelCatalogParams): Promise<ResolvedModelCatalog> {
-    const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null && String(value).trim() !== '') {
-            query.set(key, String(value).trim());
-        }
-    }
     return new Promise((resolve, reject) => {
-        get(`/api/v1/models/catalog/resolve?${query.toString()}`)
+        post(`/api/v1/models/catalog/resolve`, params)
             .then((response: any) => {
                 if (response?.success && response?.data) {
                     resolve(response.data as ResolvedModelCatalog);

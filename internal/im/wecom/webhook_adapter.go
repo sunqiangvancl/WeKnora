@@ -74,7 +74,19 @@ func validateEndpointURL(endpoint, defaultEndpoint, requiredScheme string) error
 	if u.Scheme != requiredScheme {
 		return fmt.Errorf("endpoint must use %s:// scheme, got %s://", requiredScheme, u.Scheme)
 	}
-	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+	// ValidateURLForSSRF only accepts http/https, which made every custom
+	// ws/wss endpoint fail with "invalid scheme: wss". Validate WebSocket
+	// endpoints under an https mask instead: the scheme itself was already
+	// pinned above, and every host-level guard (restricted hostnames,
+	// private/metadata IPs, DNS rebinding, port blocklist, SSRF_WHITELIST)
+	// still applies unchanged. Same approach as qqbot.validateGatewayURL.
+	ssrfTarget := endpoint
+	if u.Scheme == "ws" || u.Scheme == "wss" {
+		masked := *u
+		masked.Scheme = "https"
+		ssrfTarget = masked.String()
+	}
+	if err := secutils.ValidateURLForSSRF(ssrfTarget); err != nil {
 		return fmt.Errorf("%w (for private deployments on internal networks, add the hostname to SSRF_WHITELIST)", err)
 	}
 	return nil
@@ -149,6 +161,7 @@ func (a *WebhookAdapter) VerifyCallback(c *gin.Context) error {
 		encrypt = c.Query("echostr")
 	} else {
 		var body callbackRequestBody
+		im.LimitWebhookBody(c)
 		bodyBytes, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			return fmt.Errorf("read request body: %w", err)
@@ -192,6 +205,7 @@ func (a *WebhookAdapter) HandleURLVerification(c *gin.Context) bool {
 
 // ParseCallback parses a WeCom callback into a unified IncomingMessage.
 func (a *WebhookAdapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
+	im.LimitWebhookBody(c)
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
@@ -329,7 +343,7 @@ func (a *WebhookAdapter) sendToAppChat(ctx context.Context, accessToken, chatID 
 		ErrCode int    `json:"errcode"`
 		ErrMsg  string `json:"errmsg"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := im.DecodeIMResponse(resp.Body, &result); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if result.ErrCode != 0 {
@@ -373,7 +387,7 @@ func (a *WebhookAdapter) sendToUser(ctx context.Context, accessToken, userID str
 		ErrCode int    `json:"errcode"`
 		ErrMsg  string `json:"errmsg"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := im.DecodeIMResponse(resp.Body, &result); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if result.ErrCode != 0 {
@@ -413,7 +427,7 @@ func (a *WebhookAdapter) getAccessToken(ctx context.Context) (string, error) {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"` // seconds
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := im.DecodeIMResponse(resp.Body, &result); err != nil {
 		return "", fmt.Errorf("decode token response: %w", err)
 	}
 	if result.ErrCode != 0 {

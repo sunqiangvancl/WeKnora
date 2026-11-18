@@ -1,11 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/mcp"
@@ -18,6 +23,94 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestMCPMetadataRefreshInvalidatesLiveHeaderSchemas(t *testing.T) {
+	utils.SetSSRFWhitelistFromRaw("127.0.0.1")
+	t.Cleanup(utils.ResetSSRFWhitelistForTest)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.MCPService{}, &types.MCPMetadata{}))
+	repo := repository.NewMCPServiceRepository(db)
+	manager := mcp.NewMCPManager(nil)
+	t.Cleanup(manager.Shutdown)
+	metadata := NewMCPServiceService(repo, manager, nil).(interfaces.MCPMetadataService)
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
+	server := sdkserver.NewMCPServer("Regions", "1")
+	setHeader := func(name string) {
+		server.AddTool(sdkmcp.Tool{Name: "lookup", RawInputSchema: json.RawMessage(
+			`{"type":"object","properties":{"place":{"type":"string","x-mcp-header":"` + name + `"}}}`,
+		)}, func(context.Context, sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+			return sdkmcp.NewToolResultText("ok"), nil
+		})
+	}
+	setHeader("Region")
+	handler := sdkserver.NewStreamableHTTPServer(server, sdkserver.WithStateLess(true))
+	var mu sync.Mutex
+	lists := 0
+	var sent []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var request struct {
+				Method string `json:"method"`
+			}
+			_ = json.Unmarshal(body, &request)
+			mu.Lock()
+			switch request.Method {
+			case "tools/list":
+				lists++
+			case "tools/call":
+				sent = append(sent, "region="+r.Header.Get("Mcp-Param-Region")+
+					" zone="+r.Header.Get("Mcp-Param-Zone"))
+			}
+			mu.Unlock()
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(upstream.Close)
+	service := &types.MCPService{
+		ID: "svc", TenantID: 1, Name: "Regions", Enabled: true,
+		URL: &upstream.URL, TransportType: types.MCPTransportHTTPStreamable,
+	}
+	require.NoError(t, repo.Create(ctx, service))
+	stored, err := repo.GetByID(ctx, 1, "svc")
+	require.NoError(t, err)
+	live, err := manager.GetOrCreateClient(ctx, stored)
+	require.NoError(t, err)
+	counts := func() (int, []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return lists, append([]string(nil), sent...)
+	}
+	call := func(value string) {
+		t.Helper()
+		result, err := live.CallTool(ctx, "lookup", map[string]interface{}{"place": value})
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+	}
+
+	call("A")
+	listsBefore, headers := counts()
+	require.Equal(t, 1, listsBefore)
+	require.Equal(t, []string{"region=A zone="}, headers)
+
+	setHeader("Zone")
+	_, err = metadata.RefreshMCPMetadata(ctx, 1, "svc")
+	require.NoError(t, err)
+	afterRefresh, _ := counts()
+	require.Equal(t, listsBefore+1, afterRefresh, "the refresh lists on its own temporary client")
+	require.True(t, live.IsConnected(), "invalidation keeps the live connection")
+
+	call("B")
+	afterCall, headers := counts()
+	require.Equal(t, afterRefresh+1, afterCall, "the live client reloads its directory")
+	require.Equal(t, []string{"region=A zone=", "region= zone=B"}, headers)
+	call("C")
+	afterReuse, headers := counts()
+	require.Equal(t, afterCall, afterReuse, "the reloaded directory is cached again")
+	require.Equal(t, "region= zone=C", headers[2])
+}
 
 func TestMCPMetadataRefreshAndOfflineEditing(t *testing.T) {
 	utils.SetSSRFWhitelistFromRaw("127.0.0.1")
@@ -104,17 +197,36 @@ func TestMCPMetadataRefreshAndOfflineEditing(t *testing.T) {
 	require.True(t, got.Stale)
 	_, err = metadata.GetMCPMetadata(ctx, 2, "svc")
 	require.ErrorIs(t, err, types.ErrMCPServiceNotFound, "another tenant must not access the snapshot")
+	// A listing that started before the stored refresh does not replace it.
+	require.NoError(t, metadata.PersistMCPMetadata(
+		ctx, 1, "svc", []*types.MCPTool{{Name: "older", InputSchema: schema}}, "older",
+		types.MCPServerInfo{}, time.Now().Add(-time.Hour),
+	))
+	got, err = metadata.GetMCPMetadata(ctx, 1, "svc")
+	require.NoError(t, err)
+	require.NotEqual(t, "older", got.Instructions)
+	listedAt := time.Now().UTC().Truncate(time.Microsecond)
 	require.NoError(t, metadata.PersistMCPMetadata(
 		ctx,
 		1,
 		"svc",
 		[]*types.MCPTool{{Name: "live", Description: "from chat", InputSchema: schema}},
 		"from-chat",
+		types.MCPServerInfo{Name: "orders", Version: "2.1.0", Description: "Order lookups"},
+		listedAt,
 	))
 	got, err = metadata.GetMCPMetadata(ctx, 1, "svc")
 	require.NoError(t, err)
 	require.Equal(t, "live", got.Tools[0].Name)
 	require.Equal(t, "from-chat", got.Instructions)
+	// A directory stored from chat records the server identity, so a later
+	// connection to another server build can be recognized.
+	require.Equal(t, "orders", got.ServerName)
+	require.Equal(t, "2.1.0", got.ServerVersion)
+	require.Equal(t, "Order lookups", got.ServerDescription)
+	// It is dated by when the listing started, like a settings refresh, so the
+	// store's "older refresh never replaces a newer one" rule applies to both.
+	require.True(t, got.SyncedAt.Equal(listedAt), "synced_at %v, listed at %v", got.SyncedAt, listedAt)
 
 	// OAuth metadata belongs to the effective authorizing user, not the admin
 	// who happened to create the shared service configuration.

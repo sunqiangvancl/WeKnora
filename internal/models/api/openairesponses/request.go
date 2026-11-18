@@ -1,6 +1,6 @@
 // Package openairesponses implements the OpenAI Responses wire protocol
 // (POST /responses). Every vendor-specific deviation is driven by
-// catalog.OpenAIResponsesSettings; this package contains no vendor names.
+// api.OpenAIResponsesSettings; this package contains no vendor names.
 package openairesponses
 
 import (
@@ -9,13 +9,12 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/models/api"
-	"github.com/Tencent/WeKnora/internal/models/catalog"
 )
 
-// Config is everything the client needs, already resolved by the catalog.
+// Config is everything the client needs, already resolved by the api.
 type Config struct {
 	Endpoint api.Endpoint
-	Settings catalog.OpenAIResponsesSettings
+	Settings api.OpenAIResponsesSettings
 	// ThinkingLevels maps neutral levels to the vendor vocabulary.
 	ThinkingLevels api.ThinkingLevelMap
 	// Reasoning marks a reasoning model: sampling parameters are dropped and
@@ -213,6 +212,9 @@ func appendToLastUserText(items []any, suffix string) bool {
 func (c *Client) buildBody(messages []api.Message, opts *api.Options, stream bool) (map[string]any, error) {
 	s := c.cfg.Settings
 	instructions, input := c.convertMessages(messages)
+	if opts != nil && opts.RuntimeNotice != "" {
+		input = append(input, inputMessage{Type: "message", Role: "developer", Content: opts.RuntimeNotice})
+	}
 	body := map[string]any{
 		"model": c.cfg.Endpoint.Model,
 		"input": input,
@@ -252,11 +254,7 @@ func (c *Client) buildBody(messages []api.Message, opts *api.Options, stream boo
 	}
 	c.applyReasoning(body, opts)
 
-	for k, v := range s.ExtraBody {
-		if _, exists := body[k]; !exists {
-			body[k] = v
-		}
-	}
+	api.MergeExtraBody(body, s.ExtraBody, opts != nil && opts.Isolated)
 	return body, nil
 }
 
@@ -266,7 +264,9 @@ func (c *Client) applySampling(body map[string]any, opts *api.Options) {
 	if !c.cfg.Settings.SupportsTemperature || c.cfg.Reasoning {
 		return
 	}
-	if opts.Temperature > 0 {
+	if opts.Isolated {
+		body["temperature"] = 0.0
+	} else if opts.Temperature > 0 {
 		body["temperature"] = opts.Temperature
 	}
 	if opts.TopP > 0 {

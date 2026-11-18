@@ -90,6 +90,22 @@
         </div>
       </div>
 
+      <!-- Version reported by the connected docreader instance -->
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>{{ $t('system.docreaderVersionLabel') }}</label>
+          <p class="desc">{{ $t('system.docreaderVersionDescription') }}</p>
+        </div>
+        <div class="setting-control">
+          <span class="info-value">
+            {{ systemInfo?.docreader_version || $t('system.unknown') }}
+            <span v-if="systemInfo?.docreader_commit_id && systemInfo.docreader_commit_id !== 'unknown'" class="commit-info">
+              ({{ systemInfo.docreader_commit_id }})
+            </span>
+          </span>
+        </div>
+      </div>
+
       <!-- Service started at -->
       <div v-if="systemInfo?.started_at" class="setting-row">
         <div class="setting-info">
@@ -196,12 +212,15 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { getSystemInfo, type SystemInfo } from '@/api/system'
+import type { SystemInfo } from '@/api/system'
+import { useEditorResourcesStore } from '@/stores/editorResources'
 import { useI18n } from 'vue-i18n'
+import { docsUrl } from '@/utils/docsUrl'
 
 const { t, locale } = useI18n()
 
 // Reactive state
+const editorResources = useEditorResourcesStore()
 const systemInfo = ref<SystemInfo | null>(null)
 const loading = ref(true)
 const error = ref('')
@@ -245,8 +264,7 @@ function formatUptime(totalSeconds: number): string {
   return parts.join(' ')
 }
 
-const troubleshootingDocsURL =
-  'https://github.com/Tencent/WeKnora/blob/main/docs/migration-troubleshooting.md'
+const troubleshootingDocsURL = docsUrl('troubleshootingMigrations')
 
 // Pre-fills a new issue with the current migration error so users don't have to
 // paste it manually. Body is intentionally minimal — the bug template will fill
@@ -283,10 +301,11 @@ const loadInfo = async () => {
     loading.value = true
     error.value = ''
     
-    const systemResponse = await getSystemInfo()
-    
-    if (systemResponse.data) {
-      systemInfo.value = systemResponse.data
+    // 设置面板每次打开都要最新值；侧栏启动时拉过的快照走同一个 store。
+    await editorResources.ensureSystemInfo(true)
+
+    if (editorResources.systemInfo) {
+      systemInfo.value = editorResources.systemInfo
     } else {
       error.value = t('system.messages.fetchFailed')
     }

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -53,6 +52,7 @@ type httpReadResponse struct {
 	ImageDirPath    string            `json:"image_dir_path,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
 	Error           string            `json:"error,omitempty"`
+	SourceBlocks    []wireSourceBlock `json:"source_blocks,omitempty"`
 }
 
 // HTTPDocumentReader implements DocumentReader over HTTP/JSON.
@@ -152,12 +152,16 @@ func (p *HTTPDocumentReader) ListEngines(ctx context.Context, overrides map[stri
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("http list-engines status %d: %s", resp.StatusCode, string(respBytes))
+		preview := readErrorPreview(resp.Body)
+		return nil, fmt.Errorf("http list-engines status %d: %s", resp.StatusCode, preview)
 	}
 
+	bodyBytes, err := readCapped(resp.Body, maxJSONResponseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("http list-engines response: %w", err)
+	}
 	var out httpListEnginesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(bodyBytes, &out); err != nil {
 		return nil, fmt.Errorf("http decode list-engines response: %w", err)
 	}
 
@@ -180,6 +184,7 @@ func fromHTTPReadResponse(resp *httpReadResponse) *types.ReadResult {
 		ImageDirPath:    resp.ImageDirPath,
 		Metadata:        resp.Metadata,
 		Error:           resp.Error,
+		SourceBlocks:    sourceBlocksFromWire(resp.SourceBlocks),
 	}
 	for _, ref := range resp.ImageRefs {
 		result.ImageRefs = append(result.ImageRefs, types.ImageRef{
@@ -234,12 +239,25 @@ func (p *HTTPDocumentReader) Read(ctx context.Context, req *types.ReadRequest) (
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("http read status %d: %s", resp.StatusCode, string(bodyBytes))
+		preview := readErrorPreview(resp.Body)
+		return nil, fmt.Errorf("http read status %d: %s", resp.StatusCode, preview)
+	}
+	bodyBytes, err := readCapped(resp.Body, maxResultResponseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("http read response: %w", err)
 	}
 	var out httpReadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(bodyBytes, &out); err != nil {
 		return nil, fmt.Errorf("http decode read response: %w", err)
 	}
 	return fromHTTPReadResponse(&out), nil
+}
+
+// PreprocessImage is not offered over the HTTP transport: page straightening
+// lives in the docreader service, and this reader speaks to a different
+// surface. It reports that as a verdict — fallback=true, no error — so the
+// caller's single fallback (OCR the original bytes) is the only outcome, with
+// nothing logged that looks like a failure.
+func (p *HTTPDocumentReader) PreprocessImage(_ context.Context, _ []byte) ([]byte, bool, error) {
+	return nil, true, nil
 }

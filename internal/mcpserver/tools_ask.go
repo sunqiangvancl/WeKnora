@@ -2,7 +2,10 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,11 +18,70 @@ import (
 )
 
 const (
-	askTimeout             = 4 * time.Minute
+	defaultAskTimeout      = 4 * time.Minute
+	askProgressInterval    = 15 * time.Second
 	askCompleteWaitTimeout = 15 * time.Second
 	askSessionTitleMaxLen  = 60
 	askChannel             = "mcp"
 )
+
+// askTimeoutFromEnv returns the per-run server-side deadline. The default
+// remains four minutes for compatibility; operators can raise it for long
+// agentic MCP calls without changing unrelated chat endpoints.
+func askTimeoutFromEnv() time.Duration {
+	value := strings.TrimSpace(os.Getenv("WEKNORA_MCP_ASK_TIMEOUT"))
+	if value == "" {
+		return defaultAskTimeout
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		// Match other WeKnora timeout variables that accept bare seconds.
+		timeout, err = time.ParseDuration(value + "s")
+	}
+	if err != nil || timeout <= 0 {
+		return defaultAskTimeout
+	}
+	return timeout
+}
+
+// startAskProgress emits an initial notification and then monotonic progress
+// updates until the request ends. A nil reporter disables the ticker entirely.
+func startAskProgress(ctx context.Context, interval time.Duration, report func(float64)) func() {
+	if report == nil {
+		return func() {}
+	}
+	if interval <= 0 {
+		interval = askProgressInterval
+	}
+
+	stop := make(chan struct{})
+	finished := make(chan struct{})
+	report(0)
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		progress := 0.0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				progress++
+				report(progress)
+			}
+		}
+	}()
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			close(stop)
+			<-finished
+		})
+	}
+}
 
 func askTool() mcp.Tool {
 	return mcp.NewTool(types.MCPEndpointToolAsk,
@@ -41,11 +103,20 @@ func askTool() mcp.Tool {
 }
 
 type askReference struct {
-	KnowledgeID    string  `json:"knowledge_id"`
-	KnowledgeTitle string  `json:"knowledge_title,omitempty"`
-	ChunkID        string  `json:"chunk_id"`
-	Score          float64 `json:"score,omitempty"`
-	Excerpt        string  `json:"excerpt"`
+	KnowledgeID    string     `json:"knowledge_id"`
+	KnowledgeTitle string     `json:"knowledge_title,omitempty"`
+	ChunkID        string     `json:"chunk_id"`
+	Score          float64    `json:"score,omitempty"`
+	Excerpt        string     `json:"excerpt"`
+	Images         []askImage `json:"images,omitempty"`
+}
+
+// Keep image references separate from the truncated excerpt. OriginalURL is
+// parser provenance, not a serving URL, and must not be exposed as a fallback.
+type askImage struct {
+	URL     string `json:"url"`
+	Caption string `json:"caption,omitempty"`
+	OCRText string `json:"ocr_text,omitempty"`
 }
 
 func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -59,11 +130,15 @@ func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	}
 	question = strings.TrimSpace(question)
 
+	selectors, err := optionalKnowledgeBaseSelectors(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	agent, err := s.resolveAskAgent(ctx, ep)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	kbIDs, err := s.resolveAskKnowledgeBases(ctx, ep, agent, req.GetStringSlice("knowledge_base_ids", nil))
+	kbIDs, err := s.resolveAskKnowledgeBases(ctx, ep, agent, selectors)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -72,7 +147,22 @@ func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	answer, refs, err := s.runQA(ctx, session, agent, question, kbIDs)
+	var reportProgress func(float64)
+	if req.Params.Meta != nil && req.Params.Meta.ProgressToken != nil && s.mcp != nil {
+		token := req.Params.Meta.ProgressToken
+		reportProgress = func(progress float64) {
+			err := s.mcp.SendNotificationToClient(ctx, string(mcp.MethodNotificationProgress), map[string]any{
+				"progressToken": token,
+				"progress":      progress,
+				"message":       "WeKnora is still generating the answer.",
+			})
+			if err != nil {
+				// Progress is best effort: notification failure must never cancel QA.
+				logger.Debugf(ctx, "[mcpserver] failed to send ask progress notification: %v", err)
+			}
+		}
+	}
+	answer, refs, err := s.runQA(ctx, session, agent, question, kbIDs, reportProgress)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("failed to answer", err), nil
 	}
@@ -93,6 +183,11 @@ func (s *Server) handleAsk(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 				title = r.KnowledgeID
 			}
 			fmt.Fprintf(&b, "[%d] %s (document %s)\n", i+1, title, r.KnowledgeID)
+			for _, img := range r.Images {
+				// Preserve image references for text-only MCP hosts as well.
+				// strconv.Quote, unlike json.Marshal, keeps & < > literal.
+				fmt.Fprintf(&b, "  Image: %s\n", strconv.Quote(img.URL))
+			}
 		}
 		fmt.Fprintf(&b, "\nsession_id: %s", session.ID)
 		text = b.String()
@@ -189,6 +284,7 @@ func (s *Server) resolveAskSession(
 		return nil, fmt.Errorf("failed to bind session: %w", err)
 	}
 	created.UserID = ownerID
+	created.OwnerAuthSource = types.AuthSourceForBoundOwnerID(ownerID)
 	return created, nil
 }
 
@@ -196,8 +292,9 @@ func (s *Server) resolveAskSession(
 // the references it cited. It mirrors the IM channel's non-streaming path.
 func (s *Server) runQA(
 	ctx context.Context, session *types.Session, agent *types.CustomAgent, question string, kbIDs []string,
+	reportProgress func(float64),
 ) (string, []askReference, error) {
-	ctx, cancel := context.WithTimeout(ctx, askTimeout)
+	ctx, cancel := context.WithTimeout(ctx, askTimeoutFromEnv())
 	defer cancel()
 
 	requestID := uuid.New().String()
@@ -224,6 +321,8 @@ func (s *Server) runQA(
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create assistant message: %w", err)
 	}
+	stopProgress := startAskProgress(ctx, askProgressInterval, reportProgress)
+	defer stopProgress()
 
 	var (
 		mu       sync.Mutex
@@ -380,7 +479,7 @@ func (s *Server) runQA(
 	if err := s.messageService.UpdateMessage(context.WithoutCancel(ctx), assistantMsg); err != nil {
 		logger.Warnf(ctx, "[mcpserver] failed to persist assistant message: %v", err)
 	}
-	return text, summarizeReferences(collected), nil
+	return text, summarizeReferences(collected), runErr
 }
 
 func collectReferences(dst *[]*types.SearchResult, raw interface{}) {
@@ -400,7 +499,7 @@ const askExcerptMaxRunes = 300
 
 func summarizeReferences(refs []*types.SearchResult) []askReference {
 	out := make([]askReference, 0, len(refs))
-	seen := map[string]struct{}{}
+	seen := map[string]int{}
 	for _, r := range refs {
 		if r == nil {
 			continue
@@ -409,21 +508,69 @@ func summarizeReferences(refs []*types.SearchResult) []askReference {
 		if key == "" {
 			key = r.KnowledgeID + ":" + fmt.Sprint(r.ChunkIndex)
 		}
-		if _, dup := seen[key]; dup {
+		if index, dup := seen[key]; dup {
+			out[index].Images = summarizeReferenceImages(r.ImageInfo, out[index].Images)
 			continue
 		}
-		seen[key] = struct{}{}
-		excerpt := strings.TrimSpace(r.Content)
-		if runes := []rune(excerpt); len(runes) > askExcerptMaxRunes {
-			excerpt = string(runes[:askExcerptMaxRunes]) + "…"
-		}
+		seen[key] = len(out)
 		out = append(out, askReference{
 			KnowledgeID:    r.KnowledgeID,
 			KnowledgeTitle: r.KnowledgeTitle,
 			ChunkID:        r.ID,
 			Score:          r.Score,
-			Excerpt:        excerpt,
+			Excerpt:        truncateExcerpt(strings.TrimSpace(r.Content)),
+			Images:         summarizeReferenceImages(r.ImageInfo, nil),
 		})
+	}
+	return out
+}
+
+// truncateExcerpt cuts at askExcerptMaxRunes but never inside a storage
+// reference: half a handle is unusable and would only cost a failed lookup.
+// Whole image references are kept in askReference.Images instead.
+func truncateExcerpt(excerpt string) string {
+	runes := []rune(excerpt)
+	if len(runes) <= askExcerptMaxRunes {
+		return excerpt
+	}
+	cut := len(string(runes[:askExcerptMaxRunes]))
+	for _, loc := range types.StorageReferencePattern.FindAllStringIndex(excerpt, -1) {
+		if loc[0] >= cut {
+			break
+		}
+		if cut < loc[1] {
+			cut = loc[0]
+			break
+		}
+	}
+	return excerpt[:cut] + "…"
+}
+
+func summarizeReferenceImages(raw string, out []askImage) []askImage {
+	var infos []types.ImageInfo
+	if err := json.Unmarshal([]byte(raw), &infos); err != nil {
+		return out
+	}
+	seen := make(map[string]int, len(out)+len(infos))
+	for i, img := range out {
+		seen[img.URL] = i
+	}
+	for _, info := range infos {
+		url := strings.TrimSpace(info.URL)
+		if url == "" {
+			continue
+		}
+		if index, dup := seen[url]; dup {
+			if out[index].Caption == "" {
+				out[index].Caption = info.Caption
+			}
+			if out[index].OCRText == "" {
+				out[index].OCRText = info.OCRText
+			}
+			continue
+		}
+		seen[url] = len(out)
+		out = append(out, askImage{URL: url, Caption: info.Caption, OCRText: info.OCRText})
 	}
 	return out
 }

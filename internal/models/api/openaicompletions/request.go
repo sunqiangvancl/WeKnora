@@ -1,6 +1,6 @@
 // Package openaicompletions implements the OpenAI Chat Completions wire
 // protocol. Every vendor-specific deviation is driven by
-// catalog.OpenAICompletionsSettings; this package contains no vendor names.
+// api.OpenAICompletionsSettings; this package contains no vendor names.
 package openaicompletions
 
 import (
@@ -9,13 +9,12 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/models/api"
-	"github.com/Tencent/WeKnora/internal/models/catalog"
 )
 
-// Config is everything the client needs, already resolved by the catalog.
+// Config is everything the client needs, already resolved by the api.
 type Config struct {
 	Endpoint api.Endpoint
-	Settings catalog.OpenAICompletionsSettings
+	Settings api.OpenAICompletionsSettings
 	// ThinkingLevels maps neutral levels to the vendor vocabulary.
 	ThinkingLevels api.ThinkingLevelMap
 	// Reasoning marks a reasoning model (developer role, no sampling params
@@ -122,6 +121,17 @@ func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 		default:
 			if msg.Content != "" || len(msg.ToolCalls) == 0 {
 				wm.Content = msg.Content
+			} else {
+				// Assistant tool-call turn with empty content: emit an
+				// explicit `"content": ""` instead of omitting the field.
+				// Strict local engines (vLLM / Xinference serving Qwen-family
+				// Jinja chat templates) treat a missing content field as
+				// undefined/null and crash when rendering the assistant turn
+				// for the next round. Issue #1487. The *string keeps
+				// `omitempty` from dropping the field: a non-nil interface
+				// holding a pointer serializes as "".
+				empty := ""
+				wm.Content = &empty
 			}
 		}
 
@@ -157,7 +167,7 @@ func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 			}
 			// reasoning_details is OpenRouter's format; other vendors reject it.
 			raw, ok := msg.ReasoningMetadata[metadataReasoningDetails]
-			if ok && len(raw) > 0 && s.ThinkingFormat == catalog.ThinkingFormatOpenRouter {
+			if ok && len(raw) > 0 && s.ThinkingFormat == api.ThinkingFormatOpenRouter {
 				wm.ReasoningDetails = raw
 			}
 		}
@@ -188,9 +198,16 @@ const metadataReasoningDetails = "reasoning_details"
 // the encoded JSON is alphabetical, which keeps golden tests stable.
 func (c *Client) buildBody(messages []api.Message, opts *api.Options, stream bool) (map[string]any, error) {
 	s := c.cfg.Settings
+	wireMessages := c.convertMessages(messages)
+	if opts != nil && opts.RuntimeNotice != "" {
+		wireMessages = append(
+			wireMessages,
+			c.convertMessages([]api.Message{{Role: "system", Content: opts.RuntimeNotice}})...,
+		)
+	}
 	body := map[string]any{
 		"model":    c.cfg.Endpoint.Model,
-		"messages": c.convertMessages(messages),
+		"messages": wireMessages,
 	}
 	if stream {
 		body["stream"] = true
@@ -237,9 +254,17 @@ func (c *Client) buildBody(messages []api.Message, opts *api.Options, stream boo
 	}
 	c.applyThinking(body, opts, stream)
 
-	for k, v := range s.ExtraBody {
-		if _, exists := body[k]; !exists {
-			body[k] = v
+	api.MergeExtraBody(body, s.ExtraBody, opts != nil && opts.Isolated)
+	// These names are mutually exclusive, including when extra_body supplies
+	// one or both. Keep the protocol's configured field; an explicit caller
+	// budget already takes precedence over extra_body above.
+	if _, legacy := body["max_tokens"]; legacy {
+		if _, completion := body["max_completion_tokens"]; completion {
+			if s.MaxTokensField == "max_tokens" {
+				delete(body, "max_completion_tokens")
+			} else {
+				delete(body, "max_tokens")
+			}
 		}
 	}
 	return body, nil
@@ -250,11 +275,12 @@ func (c *Client) applySampling(body map[string]any, opts *api.Options) {
 	if !s.SupportsTemperature {
 		return
 	}
-	if s.FixedTemperature != nil {
+	if opts.Isolated {
+		body["temperature"] = 0.0
+	} else if s.FixedTemperature != nil {
 		body["temperature"] = *s.FixedTemperature
 		return
-	}
-	if opts.Temperature > 0 {
+	} else if opts.Temperature > 0 {
 		body["temperature"] = opts.Temperature
 	}
 	if opts.TopP > 0 {
@@ -310,10 +336,10 @@ func (c *Client) applyTools(body map[string]any, opts *api.Options) {
 }
 
 // applyThinking encodes the requested reasoning level in the vendor's
-// dialect. See catalog.ThinkingFormat for the dialects.
+// dialect. See api.ThinkingFormat for the dialects.
 func (c *Client) applyThinking(body map[string]any, opts *api.Options, stream bool) {
 	s := c.cfg.Settings
-	if s.ThinkingFormat == catalog.ThinkingFormatNone || s.ThinkingFormat == "" {
+	if s.ThinkingFormat == api.ThinkingFormatNone || s.ThinkingFormat == "" {
 		return
 	}
 	levels := c.cfg.ThinkingLevels
@@ -357,7 +383,7 @@ func (c *Client) applyThinking(body map[string]any, opts *api.Options, stream bo
 	}
 
 	switch s.ThinkingFormat {
-	case catalog.ThinkingFormatOpenAI:
+	case api.ThinkingFormatOpenAI:
 		if enabled {
 			if effort != "" {
 				body[effortField] = effort
@@ -365,7 +391,7 @@ func (c *Client) applyThinking(body map[string]any, opts *api.Options, stream bo
 		} else if v, ok := levels[api.ReasoningOff]; ok && v != nil && *v != "" {
 			body[effortField] = *v
 		}
-	case catalog.ThinkingFormatThinkingType:
+	case api.ThinkingFormatThinkingType:
 		if enabled {
 			body["thinking"] = map[string]any{"type": orDefault(s.ThinkingEnabledValue, "enabled")}
 			if effort != "" {
@@ -374,14 +400,17 @@ func (c *Client) applyThinking(body map[string]any, opts *api.Options, stream bo
 		} else {
 			body["thinking"] = map[string]any{"type": "disabled"}
 		}
-	case catalog.ThinkingFormatEnableThinking:
+	case api.ThinkingFormatEnableThinking:
 		body["enable_thinking"] = enabled
 		if effort != "" {
 			body[effortField] = effort
 		}
-	case catalog.ThinkingFormatChatTemplateKwargs:
+	case api.ThinkingFormatChatTemplateKwargs:
 		body["chat_template_kwargs"] = map[string]any{"enable_thinking": enabled}
-	case catalog.ThinkingFormatOpenRouter:
+		if effort != "" {
+			body[effortField] = effort
+		}
+	case api.ThinkingFormatOpenRouter:
 		if enabled {
 			reasoning := map[string]any{}
 			if effort != "" {

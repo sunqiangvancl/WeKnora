@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
@@ -102,5 +103,35 @@ func TestExtractChunkMatchSnippet_NonFAQUsesBodyContext(t *testing.T) {
 	}
 	if !strings.Contains(snippet, "前置") || !strings.Contains(snippet, "后续") {
 		t.Fatalf("expected expanded body context: %s", snippet)
+	}
+}
+
+// A Chinese question has no spaces; it is segmented into words so the
+// snippet lands on the matching passage instead of the chunk's opening.
+func TestExtractSnippetForChineseQuery(t *testing.T) {
+	content := strings.Repeat("无关的开头内容。", 60) + "退款申请需要在收货后七天内提交。" + strings.Repeat("其他内容。", 20)
+	snippet := extractSnippetForQueries(content, []string{"退款申请的时限是多久？"})
+	if !strings.Contains(snippet, "退款申请") {
+		t.Fatalf("snippet did not reach the matching passage: %q", snippet)
+	}
+}
+
+func TestExtractSnippetForQueriesPreservesUnicodeOffsets(t *testing.T) {
+	content := strings.Repeat("İ", 500) + " refund policy"
+	snippet := extractSnippetForQueries(content, []string{"refund"})
+	if !utf8.ValidString(snippet) {
+		t.Errorf("snippet contains invalid UTF-8: %q", snippet)
+	}
+	if !strings.Contains(snippet, "refund") {
+		t.Errorf("snippet omitted the matched query term: %q", snippet)
+	}
+}
+
+func TestSearchQueryTokensSkipsStopwords(t *testing.T) {
+	tokens := searchQueryTokens([]string{"How does the engine start?"})
+	for _, tok := range tokens {
+		if tok == "the" || tok == "does" || tok == "how" {
+			t.Fatalf("stopword %q kept: %v", tok, tokens)
+		}
 	}
 }

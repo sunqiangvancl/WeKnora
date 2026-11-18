@@ -135,6 +135,10 @@ func (s *obsFileService) CheckConnectivity(ctx context.Context) error {
 }
 
 func (s *obsFileService) parseObsFilePath(filePath string) (string, error) {
+	// Canonical storage://<backend-id>/... paths must unwrap before prefix
+	// matching, otherwise the whole canonical form silently falls through to
+	// the raw passthrough below and is returned as the object key (#3151).
+	filePath = storageBackendInnerPath(filePath)
 	prefix := s.getPrifix()
 
 	if strings.HasPrefix(filePath, prefix) {
@@ -349,7 +353,7 @@ func (s *obsFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 		Key:         aws.String(objectKey),
 		Body:        strings.NewReader(string(data)),
 		ContentType: aws.String("application/octet-stream"),
-		ACL:         "public-read",
+		// ACL:         "public-read",
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload bytes to OBS: %w", err)

@@ -394,13 +394,34 @@ The <new_information> block above is assembled from VERBATIM source chunks alrea
 4. Preserve existing information that is still valid and still about {{.PageTitle}}.
 5. Keep [[slug|name]] wiki-link references ONLY if the slug appears in the <valid_wiki_links> list above. Remove any [[slug|name]] whose slug is NOT in that list. Do NOT invent new wiki-link slugs. The page's own slug ({{.PageSlug}}) MUST NOT appear as a [[...]] link inside its own content.
 6. Maintain the existing page structure and formatting style. Use "# {{.PageTitle}}" as the top-level heading if the page does not already have one. Do NOT introduce new heading levels beyond what the source or existing page justifies.
-{{if .HasRetractions}}
+{{if and .HasRetractions (not .HasAdditions)}}
 7. If after removing deleted content the page becomes nearly empty and there is no new information to add, output just: "SUMMARY: (empty page)\n# {{.PageTitle}}\n\n*This page's primary source document was removed.*"
 {{end}}
 8. Write in {{.Language}}.
 </instructions>
 
 Output the SUMMARY line first, then the updated Markdown content. Do not include any other preamble.`
+
+// WikiPageModifyContinuationPrompt resumes a page rewrite that the provider cut
+// off at the completion budget (finish_reason=length). Long enumerations are the
+// shape that hits the cap: a certificate ledger with a hundred-plus holder rows
+// is emitted row by row, and the provider stops the model mid-table, so the page
+// is persisted one third short. The partial page is replayed as an assistant
+// turn and this prompt asks for the remainder — WITHOUT the replay the model
+// answers the original question again from the top, which is the #3446 spiral
+// the agent loop works around.
+const WikiPageModifyContinuationPrompt = `Your previous message was cut off because it reached the ` +
+	`output length limit, so the page is incomplete.
+
+Continue the SAME message from exactly where it stopped:
+1. Do NOT repeat anything you already wrote — not the SUMMARY line, not the headings, not the ` +
+	`rows, not the opening of the row you were in the middle of.
+2. Your reply is appended verbatim to what you already wrote. Its first characters must be exactly ` +
+	`the characters that follow the last character of your previous message. If you stopped in the ` +
+	`middle of a Markdown table row, finish that row first.
+3. Keep the same structure, formatting, ordering, and language as the part you already wrote.
+4. Output the continuation ONLY: no preamble, no apology, no explanation, no closing code fence.
+5. If the page was in fact already complete, reply with exactly: (complete)`
 
 // WikiIndexIntroPrompt generates the introduction for a NEW index page (first time only).
 const WikiIndexIntroPrompt = `You are a wiki editor. Write a brief introduction for a wiki knowledge base index page.

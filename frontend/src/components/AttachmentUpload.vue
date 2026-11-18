@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { MessagePlugin } from 'tdesign-vue-next';
 import { useI18n } from 'vue-i18n';
 import { MAX_FILE_SIZE_MB } from '@/utils';
-import { getParserEngines } from '@/api/system';
+import ArtifactFileIcon from '@/views/chat/components/ArtifactFileIcon.vue';
+import { useEditorResourcesStore } from '@/stores/editorResources';
 import {
   deleteTemporaryAttachment,
   getTemporaryAttachment,
@@ -12,6 +13,7 @@ import {
 } from '@/api/chat/temporary-attachments';
 
 const { t } = useI18n();
+const editorResources = useEditorResourcesStore();
 
 export interface AttachmentFile {
   file: File;
@@ -44,6 +46,7 @@ const attachments = ref<AttachmentFile[]>([]);
 const fileInputRef = ref<HTMLInputElement>();
 const pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let disposed = false;
+let sessionEpoch = 0;
 
 // Supported file types (matching backend)
 const supportedTypes = ref([
@@ -61,8 +64,8 @@ const supportedTypes = ref([
 
 onMounted(async () => {
   try {
-    const response = await getParserEngines();
-    const discovered = (response.data || [])
+    await editorResources.ensureParserEngines();
+    const discovered = editorResources.parserEngines
       .filter(engine => engine.Available !== false)
       .flatMap(engine => engine.FileTypes || [])
       .filter(type => type && type.toLowerCase() !== 'url')
@@ -138,51 +141,82 @@ const addFiles = async (files: File[]) => {
 const emitFiles = () => emit('update:files', [...attachments.value]);
 
 const uploadAttachment = async (attachment: AttachmentFile) => {
-  if (!props.sessionId) return;
+  const uploadSessionId = props.sessionId;
+  const uploadEpoch = sessionEpoch;
+  if (!uploadSessionId) return;
   try {
     const response = await uploadTemporaryAttachment(
-      props.sessionId,
+      uploadSessionId,
       attachment.file,
       props.agentId,
       props.agentSourceTenantId,
       'auto',
       (progress) => {
+        if (disposed || (props.sessionId !== uploadSessionId || sessionEpoch !== uploadEpoch) || !attachments.value.some(item => item.id === attachment.id)) return;
         attachment.progress = progress;
         emitFiles();
       },
     );
     attachment.documentId = response.data.id;
-    if (disposed || !attachments.value.some(item => item.id === attachment.id)) {
-      await deleteTemporaryAttachment(props.sessionId, response.data.id).catch(() => undefined);
+    if (disposed || (props.sessionId !== uploadSessionId || sessionEpoch !== uploadEpoch) || !attachments.value.some(item => item.id === attachment.id)) {
+      const index = attachments.value.findIndex(item => item.id === attachment.id);
+      if (index !== -1) {
+        attachments.value.splice(index, 1);
+        emitFiles();
+      }
+      await deleteTemporaryAttachment(uploadSessionId, response.data.id).catch(() => undefined);
       return;
     }
     attachment.status = response.data.status;
     attachment.progress = 100;
     emitFiles();
     if (attachment.status !== 'ready' && attachment.status !== 'failed') {
-      scheduleStatusPoll(attachment);
+      scheduleStatusPoll(attachment, uploadSessionId, uploadEpoch);
     }
   } catch (error: any) {
+    if (disposed || (props.sessionId !== uploadSessionId || sessionEpoch !== uploadEpoch) || !attachments.value.some(item => item.id === attachment.id)) {
+      const index = attachments.value.findIndex(item => item.id === attachment.id);
+      if (index !== -1) {
+        attachments.value.splice(index, 1);
+        emitFiles();
+      }
+      return;
+    }
     attachment.status = 'failed';
     attachment.error = error?.message || t('chat.attachmentUploadFailed');
     emitFiles();
   }
 };
 
-const scheduleStatusPoll = (attachment: AttachmentFile) => {
+const scheduleStatusPoll = (attachment: AttachmentFile, uploadSessionId: string, uploadEpoch: number) => {
   clearPoll(attachment.id);
-  pollTimers.set(attachment.id, setTimeout(() => void pollStatus(attachment), 800));
+  pollTimers.set(attachment.id, setTimeout(() => void pollStatus(attachment, uploadSessionId, uploadEpoch), 800));
 };
 
-const pollStatus = async (attachment: AttachmentFile) => {
-  if (!props.sessionId || !attachment.documentId || !attachments.value.some(item => item.id === attachment.id)) return;
+const pollStatus = async (attachment: AttachmentFile, uploadSessionId: string, uploadEpoch: number) => {
+  if (!attachment.documentId || !attachments.value.some(item => item.id === attachment.id)) return;
+  const documentId = attachment.documentId;
+  const discardIfStale = () => {
+    if (props.sessionId === uploadSessionId && sessionEpoch === uploadEpoch && !disposed) return false;
+    const index = attachments.value.findIndex(item => item.id === attachment.id);
+    if (index !== -1) {
+      attachments.value.splice(index, 1);
+      emitFiles();
+    }
+    // A document already uploaded may have been sent while parsing. Keep the
+    // server copy; it is subject to the normal temporary-attachment expiry.
+    return true;
+  };
+  if (discardIfStale()) return;
   try {
-    const response = await getTemporaryAttachment(props.sessionId, attachment.documentId);
+    const response = await getTemporaryAttachment(uploadSessionId, documentId);
+    if (discardIfStale() || !attachments.value.some(item => item.id === attachment.id)) return;
     attachment.status = response.data.status;
     attachment.error = response.data.error_message;
     emitFiles();
-    if (attachment.status !== 'ready' && attachment.status !== 'failed') scheduleStatusPoll(attachment);
+    if (attachment.status !== 'ready' && attachment.status !== 'failed') scheduleStatusPoll(attachment, uploadSessionId, uploadEpoch);
   } catch (error: any) {
+    if (discardIfStale() || !attachments.value.some(item => item.id === attachment.id)) return;
     attachment.status = 'failed';
     attachment.error = error?.message || t('chat.attachmentParseFailed');
     emitFiles();
@@ -194,6 +228,20 @@ const clearPoll = (id: string) => {
   if (timer) clearTimeout(timer);
   pollTimers.delete(id);
 };
+
+// A mounted composer can be reused by the embedded assistant without a route
+// change. Do not leave A's attachments available to send in session B.
+watch(() => props.sessionId, (nextSession, previousSession) => {
+  sessionEpoch += 1;
+  // Local files selected before a new session exists belong to its first send.
+  if (!previousSession || nextSession === previousSession) return;
+  const pending = attachments.value;
+  attachments.value = [];
+  pending.forEach(attachment => {
+    clearPoll(attachment.id);
+  });
+  if (pending.length) emitFiles();
+}, { flush: 'sync' });
 
 const removeAttachment = (id: string) => {
   const index = attachments.value.findIndex(a => a.id === id);
@@ -213,22 +261,6 @@ const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-};
-
-const getFileExt = (fileName: string): string => {
-  return fileName.split('.').pop()?.toUpperCase() || 'FILE';
-};
-
-const getFileIcon = (fileName: string): string => {
-  const ext = fileName.split('.').pop()?.toLowerCase();
-  if (['pdf'].includes(ext || '')) return 'file-pdf';
-  if (['doc', 'docx'].includes(ext || '')) return 'file-word';
-  if (['xls', 'xlsx'].includes(ext || '')) return 'file-excel';
-  if (['ppt', 'pptx'].includes(ext || '')) return 'file-powerpoint';
-  if (['epub', 'mhtml'].includes(ext || '')) return 'file';
-  if (['txt', 'md'].includes(ext || '')) return 'file';
-  if (['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac'].includes(ext || '')) return 'sound';
-  return 'file';
 };
 
 const statusLabel = (attachment: AttachmentFile): string => {
@@ -277,19 +309,10 @@ defineExpose({
         :key="attachment.id"
         class="attachment-preview-item"
       >
-        <div class="attachment-preview-icon">
-          <svg viewBox="0 0 40 48" fill="none" xmlns="http://www.w3.org/2000/svg" width="32" height="38">
-            <rect width="40" height="48" rx="4" fill="#4A90D9"/>
-            <path d="M8 6h16l8 8v28a2 2 0 01-2 2H8a2 2 0 01-2-2V8a2 2 0 012-2z" fill="#5BA3E8"/>
-            <path d="M24 6l8 8h-6a2 2 0 01-2-2V6z" fill="#3A7BC8"/>
-            <rect x="10" y="20" width="20" height="2" rx="1" fill="white" fill-opacity="0.9"/>
-            <rect x="10" y="26" width="20" height="2" rx="1" fill="white" fill-opacity="0.9"/>
-            <rect x="10" y="32" width="14" height="2" rx="1" fill="white" fill-opacity="0.9"/>
-          </svg>
-        </div>
+        <ArtifactFileIcon :file-name="attachment.name" />
         <div class="attachment-preview-info">
-          <div class="attachment-preview-name">{{ attachment.name }}</div>
-          <div class="attachment-preview-meta">{{ getFileExt(attachment.name) }}&nbsp;·&nbsp;{{ formatFileSize(attachment.size) }}</div>
+          <div class="attachment-preview-name" :title="attachment.name">{{ attachment.name }}</div>
+          <div class="attachment-preview-meta">{{ formatFileSize(attachment.size) }}</div>
           <div v-if="attachment.status !== 'local'" class="attachment-preview-status" :class="`is-${attachment.status}`">
             <span v-if="attachment.status === 'uploading' || attachment.status === 'uploaded' || attachment.status === 'processing'" class="attachment-status-spinner" />
             {{ statusLabel(attachment) }}
@@ -329,13 +352,6 @@ defineExpose({
   max-width: 240px;
   min-width: 140px;
   cursor: default;
-
-  .attachment-preview-icon {
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
 
   .attachment-preview-info {
     flex: 1;

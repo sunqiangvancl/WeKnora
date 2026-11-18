@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRealExtension(t *testing.T) {
@@ -105,7 +108,7 @@ func TestRealExtension(t *testing.T) {
 			w,
 			`<!doctype html><title>BrowserSkill integration</title>
 <label>Name <input id="name"></label>
-<button
+<button id="save"
  onclick="document.querySelector('#result').textContent='你好 '+document.querySelector('#name').value">Save</button>
 <p id="result"></p>
 <a id="new-tab" href="/linked" target="_blank" rel="noopener">Open linked page</a>
@@ -114,13 +117,41 @@ func TestRealExtension(t *testing.T) {
 		)
 	}))
 	defer fixture.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	scope := Scope{1, "real-extension-test"}
 	call := func(
 		ctx context.Context, scope Scope, session, method string, params map[string]any,
 	) (json.RawMessage, error) {
 		started := time.Now()
+		// This fixture client reads a fresh sync before each guarded operation.
+		// Production callers must choose their action from the returned evidence;
+		// the gateway never manufactures or refreshes their receipts.
+		switch method {
+		case "navigate", "navigate_back", "navigate_forward", "reload", "click", "fill", "press",
+			"hover", "wheel", "scroll_to", "focus", "blur", "select", "evaluate", "tab_close":
+			if status := m.Status(scope, session); status.SessionID != "" && !status.Paused {
+				synced, err := m.Call(ctx, scope, session, "cooperate", map[string]any{
+					"action": "sync", "tab_id": params["tab_id"],
+				})
+				if err != nil {
+					return nil, err
+				}
+				var receipt struct {
+					Context     string `json:"context_id"`
+					Observation string `json:"observation_id"`
+				}
+				if err := json.Unmarshal(synced, &receipt); err != nil ||
+					receipt.Context == "" || receipt.Observation == "" {
+					return nil, fmt.Errorf("missing shared-control receipt: %s", synced)
+				}
+				params = maps.Clone(params)
+				if params == nil {
+					params = map[string]any{}
+				}
+				params["context_id"], params["observation_id"] = receipt.Context, receipt.Observation
+			}
+		}
 		result, err := m.Call(ctx, scope, session, method, params)
 		t.Logf("browser RPC %s: %s (error=%v)", method, time.Since(started).Round(time.Millisecond), err)
 		return result, err
@@ -163,7 +194,7 @@ func TestRealExtension(t *testing.T) {
 		}
 	}()
 	if err = json.NewEncoder(input).Encode(map[string]string{
-		"pairing": link, "extension": extension,
+		"pairing": link, "extension": extension, "fixture": fixture.URL,
 		"chromium":   os.Getenv("BROWSERSKILL_TEST_CHROMIUM"),
 		"playwright": os.Getenv("BROWSERSKILL_TEST_PLAYWRIGHT"),
 	}); err != nil {
@@ -221,8 +252,53 @@ func TestRealExtension(t *testing.T) {
 	if !strings.Contains(string(snap), "Save") {
 		t.Fatalf("page missing: %s", snap)
 	}
+	// Upgrading only the binary connects successfully but rejects existing
+	// interactions. Exercise the actual extension's control/observation contract.
+	_, err = m.Call(ctx, scope, "chat", "fill", map[string]any{"selector": "#name", "value": "blocked"})
+	var controlErr *RPCError
+	require.ErrorAs(t, err, &controlErr)
+	require.Contains(t, string(controlErr.Data), "cooperation_sync_required")
+	synced, err := m.Call(ctx, scope, "chat", "cooperate", map[string]any{"action": "sync"})
+	require.NoError(t, err)
+	var receipt struct {
+		Context     string `json:"context_id"`
+		Observation string `json:"observation_id"`
+		Policy      string `json:"control_policy"`
+	}
+	require.NoError(t, json.Unmarshal(synced, &receipt))
+	require.Equal(t, "target", receipt.Policy)
+	require.NotEmpty(t, receipt.Context)
+	require.NotEmpty(t, receipt.Observation)
+	require.Contains(t, string(synced), "Save")
+	_, err = m.Call(ctx, scope, "chat", "fill", map[string]any{
+		"selector": "#name", "value": "shared control", "context_id": receipt.Context,
+	})
+	require.NoError(t, err)
+	_, err = m.Call(ctx, scope, "chat", "snapshot", nil)
+	require.NoError(t, err)
+	click := map[string]any{
+		"selector": "#save", "context_id": receipt.Context,
+		"expect": []map[string]any{{"target": "#name", "field": "value", "equals": "different"}},
+	}
+	_, err = m.Call(ctx, scope, "chat", "click", click)
+	require.ErrorAs(t, err, &controlErr)
+	require.Contains(t, string(controlErr.Data), "precondition_failed")
+	click["expect"] = []map[string]any{{"target": "#name", "field": "value", "equals": "shared control"}}
+	_, err = m.Call(ctx, scope, "chat", "click", click)
+	require.NoError(t, err, "target context survives actions, reads and a rejected condition")
+	verified, err := m.Call(ctx, scope, "chat", "snapshot", nil)
+	require.NoError(t, err)
+	require.Contains(t, string(verified), "你好 shared control")
+	_, err = m.Call(ctx, scope, "chat", "evaluate", map[string]any{
+		"expression": "document.title", "context_id": receipt.Context,
+	})
+	require.ErrorAs(t, err, &controlErr)
+	require.Contains(t, string(controlErr.Data), "observation_required")
+	require.False(t, m.Status(scope, "chat").Paused, "coordination refusals still allow synchronization")
+	snap = verified // The first sync replaces pre-policy refs; crop with current refs.
 	var snapshot struct {
-		Text string `json:"text"`
+		Text  string `json:"text"`
+		TabID int    `json:"tab_id"`
 	}
 	if err = json.Unmarshal(snap, &snapshot); err != nil {
 		t.Fatal(err)
@@ -298,7 +374,7 @@ func TestRealExtension(t *testing.T) {
 	if _, err = call(ctx, scope, "chat", "fill", map[string]any{"selector": "#name", "value": "世界"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": "button"}); err != nil {
+	if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": "#save"}); err != nil {
 		t.Fatal(err)
 	}
 	snap, err = call(ctx, scope, "chat", "snapshot", nil)
@@ -309,20 +385,94 @@ func TestRealExtension(t *testing.T) {
 		t.Fatalf("action result missing: %s", snap)
 	}
 	checkBackground()
-	// Agent-created navigation targets remain usable throughout their lifecycle.
-	// Cover both noopener links and script-created popup windows.
-	for _, selector := range []string{"#new-tab", "#popup"} {
-		if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": selector}); err != nil {
+	hostAck := func(command, expected string) {
+		t.Helper()
+		if _, err := fmt.Fprintln(input, command); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case line := <-hostLines:
+			if line != expected {
+				t.Fatalf("browser host %s: %s", command, line)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	assertDenied := func(tabID int) {
+		t.Helper()
+		for _, method := range []string{"tab_select", "snapshot", "tab_close"} {
+			_, err := call(ctx, scope, "chat", method, map[string]any{"tab_id": tabID})
+			if err == nil || !strings.Contains(err.Error(), "permission_denied") {
+				t.Fatalf("unauthorized tab %d accepted %s: %v", tabID, method, err)
+			}
+		}
+	}
+	borrowTab := func(tabID int) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			_, err := call(ctx, scope, "chat", "tab_borrow", map[string]any{"tab_id": tabID})
+			done <- err
+		}()
+		for !m.Status(scope, "chat").NeedsHelp {
+			select {
+			case err := <-done:
+				t.Fatalf("borrow finished without browser confirmation: %v", err)
+			case <-tick.C:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+		if m.Status(scope, "chat").Action != "tab_borrow" {
+			t.Fatal("borrow confirmation must identify its handoff separately from login help")
+		}
+		hostAck("approve-borrow", "approve-borrow-done")
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	returnTab := func(tabID int) {
+		t.Helper()
+		hostAck(fmt.Sprintf("before-tab-return %d", tabID), "return-recorded")
+		result, err := call(ctx, scope, "chat", "tab_return", map[string]any{"tab_id": tabID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, result); err != nil {
+			t.Fatal(err)
+		}
+		hostAck("expect-returned-tab "+compact.String(), "returned-tab-preserved")
+		assertDenied(tabID)
+	}
+	// Same-window navigation targets are observed; independent popup windows
+	// require the official borrow/return flow, even when opened by native input.
+	for _, target := range []struct {
+		selector string
+		path     string
+		borrow   bool
+	}{
+		{"#new-tab", "/linked", false},
+		{"#popup", "/popup", true},
+	} {
+		t.Logf("navigation target %s (borrow=%t)", target.selector, target.borrow)
+		_, err = call(ctx, scope, "chat", "tab_select", map[string]any{"tab_id": snapshot.TabID})
+		require.NoError(t, err, "closing/returning a task tab requires explicitly selecting the next target")
+		if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": target.selector}); err != nil {
 			t.Fatal(err)
 		}
 		popupID := 0
-		var e error
-		deadline := time.NewTimer(3 * time.Second)
-	waitPopup:
+		deadline := time.After(3 * time.Second)
 		for popupID == 0 {
-			listed, listErr := call(ctx, scope, "chat", "tab_list", map[string]any{"scope": "all"})
-			if listErr != nil {
-				t.Fatal(listErr)
+			listed, err := call(ctx, scope, "chat", "tab_list", map[string]any{"scope": "all"})
+			if err != nil {
+				t.Fatal(err)
 			}
 			var result struct {
 				Tabs []struct {
@@ -330,38 +480,49 @@ func TestRealExtension(t *testing.T) {
 					URL string `json:"url"`
 				} `json:"tabs"`
 			}
-			if e = json.Unmarshal(listed, &result); e != nil {
-				t.Fatal(e)
+			if err := json.Unmarshal(listed, &result); err != nil {
+				t.Fatal(err)
 			}
 			for _, tab := range result.Tabs {
-				if strings.HasSuffix(tab.URL, "/linked") || strings.HasSuffix(tab.URL, "/popup") {
+				if tab.URL == fixture.URL+target.path {
 					popupID = tab.ID
 				}
 			}
 			if popupID != 0 {
-				break waitPopup
+				break
 			}
 			select {
 			case <-tick.C:
-			case <-deadline.C:
+			case <-deadline:
 				t.Fatalf("fixture popup missing: %s", listed)
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
 		}
-		deadline.Stop()
-		if _, e = call(ctx, scope, "chat", "tab_select", map[string]any{"tab_id": popupID}); e != nil {
-			t.Fatal(e)
+		if target.borrow {
+			assertDenied(popupID)
+			borrowTab(popupID)
 		}
-		if _, e = call(ctx, scope, "chat", "snapshot", map[string]any{"tab_id": popupID}); e != nil {
-			t.Fatal(e)
+		if _, err = call(ctx, scope, "chat", "tab_select", map[string]any{"tab_id": popupID}); err != nil {
+			t.Fatal(err)
 		}
-		if _, e = call(ctx, scope, "chat", "tab_close", map[string]any{"tab_id": popupID}); e != nil {
-			t.Fatal(e)
+		if _, err = call(ctx, scope, "chat", "snapshot", map[string]any{"tab_id": popupID}); err != nil {
+			t.Fatal(err)
+		}
+		if target.borrow {
+			if _, err = call(ctx, scope, "chat", "tab_close", map[string]any{"tab_id": popupID}); err == nil ||
+				!strings.Contains(err.Error(), "invalid_params") {
+				t.Fatalf("borrowed popup was closable: %v", err)
+			}
+			returnTab(popupID)
+			// Keep the returned page: later cleanup checks must prove that
+			// task stop preserves it and releases its debugger attachment.
+		} else if _, err = call(ctx, scope, "chat", "tab_close", map[string]any{"tab_id": popupID}); err != nil {
+			t.Fatal(err)
 		}
 	}
-	// A genuine user-created tab inside the task window remains unauthorized,
-	// but can be borrowed there with an actual browser confirmation.
+	// An unrelated user-created tab is routed out of the Agent Window. It
+	// remains unauthorized until borrowed with actual browser confirmation.
 	_, _ = io.WriteString(input, "create-unowned-tab\n")
 	var userTab struct {
 		ID int `json:"tab_id"`
@@ -380,48 +541,11 @@ func TestRealExtension(t *testing.T) {
 			t.Fatalf("unowned user tab accepted %s: %v", method, err)
 		}
 	}
-	borrowDone := make(chan error, 1)
-	go func() {
-		_, borrowErr := call(ctx, scope, "chat", "tab_borrow", map[string]any{"tab_id": userTab.ID})
-		borrowDone <- borrowErr
-	}()
-	for !m.Status(scope, "chat").NeedsHelp {
-		select {
-		case <-tick.C:
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		}
-	}
-	if m.Status(scope, "chat").Action != "tab_borrow" {
-		t.Fatal("borrow confirmation must identify its handoff separately from login help")
-	}
-	_, _ = io.WriteString(input, "approve-borrow\n")
-	select {
-	case line := <-hostLines:
-		if line != "approve-borrow-done" {
-			t.Fatalf("borrow confirmation: %s", line)
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
-	select {
-	case err = <-borrowDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
+	borrowTab(userTab.ID)
 	if _, err = call(ctx, scope, "chat", "snapshot", map[string]any{"tab_id": userTab.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = call(ctx, scope, "chat", "tab_return", map[string]any{"tab_id": userTab.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = call(ctx, scope, "chat", "snapshot", map[string]any{"tab_id": userTab.ID}); err == nil ||
-		!strings.Contains(err.Error(), "permission_denied") {
-		t.Fatalf("returned tab remained readable: %v", err)
-	}
+	returnTab(userTab.ID)
 	_, _ = fmt.Fprintf(input, "remove-fixture-tab %d\n", userTab.ID)
 	select {
 	case line := <-hostLines:
@@ -655,7 +779,7 @@ func TestRealExtension(t *testing.T) {
 	if err = m.Control(ctx, scope, "chat", "pause"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": "button"}); err == nil {
+	if _, err = call(ctx, scope, "chat", "click", map[string]any{"selector": "#save"}); err == nil {
 		t.Fatal("paused click accepted")
 	}
 	if err = m.Control(ctx, scope, "chat", "resume"); err != nil {
@@ -677,6 +801,9 @@ func TestRealExtension(t *testing.T) {
 			t.Fatal(ctx.Err())
 		}
 	}
+	require.ErrorContains(t, m.Control(ctx, scope, "chat", "resume"), "BrowserSkill browser overlay")
+	require.True(t, m.Status(scope, "chat").Paused)
+	hostAck("resume-browser-control", "browser-control-resumed")
 	if err = m.Control(ctx, scope, "chat", "resume"); err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +870,7 @@ func TestRealExtension(t *testing.T) {
 		select {
 		case line := <-hostLines:
 			if line != `{"cleaned":true}` {
-				t.Fatalf("browser task leaked tabs or groups: %s", line)
+				t.Fatalf("browser cleanup changed user tabs or leaked task tabs: %s", line)
 			}
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
@@ -762,6 +889,10 @@ func TestRealExtension(t *testing.T) {
 	if err != nil || json.Unmarshal(lastPage, &lastTab) != nil || lastTab.ID == 0 {
 		t.Fatalf("last tab fixture: %s, %v", lastPage, err)
 	}
+	_, err = call(ctx, scope, "chat", "tab_close", map[string]any{"tab_id": lastTab.ID})
+	require.ErrorContains(t, err, "Before closing the last tab")
+	_, err = call(ctx, scope, "chat", "tab_create", map[string]any{"url": "about:blank", "active": false})
+	require.NoError(t, err)
 	if _, err = call(ctx, scope, "chat", "tab_close", map[string]any{"tab_id": lastTab.ID}); err != nil {
 		t.Fatal(err)
 	}
@@ -816,8 +947,26 @@ func TestRealExtension(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkCleanup()
-	// Repeated successful turns must return to the original user tabs, with
-	// no live task groups left over. The next turn can start without Resume.
+	// A moved controlled tab ends its upstream session. Resume must create a
+	// new session rather than getting stuck on the daemon's terminal tombstone.
+	require.NoError(t, m.Control(ctx, scope, "chat", "select"))
+	lastPage, err = call(ctx, scope, "chat", "navigate", map[string]any{"url": fixture.URL})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(lastPage, &lastTab))
+	movedSession := m.Status(scope, "chat").SessionID
+	hostAck(fmt.Sprintf("move-controlled-tab-out %d", lastTab.ID), "controlled-tab-moved")
+	require.Eventually(t, func() bool {
+		status := m.Status(scope, "chat")
+		return status.Paused && status.SessionID == ""
+	}, 5*time.Second, 10*time.Millisecond)
+	_, err = m.Call(ctx, scope, "chat", "navigate", map[string]any{"url": fixture.URL})
+	require.ErrorContains(t, err, "task_paused")
+	require.NoError(t, m.Control(ctx, scope, "chat", "resume"))
+	require.NotEqual(t, movedSession, m.Status(scope, "chat").SessionID)
+	require.NoError(t, m.FinishTurn(ctx, scope, "chat", false))
+	checkCleanup()
+	// Repeated successful turns preserve the original and returned user tabs,
+	// with no agent-created tabs left over. The next turn needs no Resume.
 	for round := range 3 {
 		t.Logf("automatic cleanup round %d", round+1)
 		if err = m.Control(ctx, scope, "chat", "select"); err != nil {

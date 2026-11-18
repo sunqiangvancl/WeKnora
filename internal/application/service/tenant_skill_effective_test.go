@@ -277,3 +277,126 @@ func TestEffectiveTenantSkillsToleratesMissingDependencies(t *testing.T) {
 	require.Empty(t, effectiveTenantSkills(context.Background(), nil, fx.skills, 7, "cfg-1"))
 	require.Empty(t, effectiveTenantSkills(context.Background(), fx.configs, nil, 7, "cfg-1"))
 }
+
+type listerFunc func(context.Context, uint64, string) ([]*types.TenantSkillEntity, error)
+
+func (f listerFunc) ListSkillsByConfig(
+	ctx context.Context, tenantID uint64, configID string,
+) ([]*types.TenantSkillEntity, error) {
+	return f(ctx, tenantID, configID)
+}
+
+type installedTree struct {
+	HostSkillTree
+	installed map[string]bool
+}
+
+func (t installedTree) Installed(name string) bool { return t.installed[name] }
+
+func TestHostSkillsForRunNeedsFilesOnDisk(t *testing.T) {
+	rows := []*types.TenantSkillEntity{
+		{ID: "a", TenantID: 7, SandboxConfigID: "host", Name: "pdf", Enabled: true, Status: types.SkillStatusReady},
+		{ID: "b", TenantID: 7, SandboxConfigID: "host", Name: "docx", Enabled: true, Status: types.SkillStatusReady},
+		{ID: "c", TenantID: 7, SandboxConfigID: "host", Name: "xlsx", Enabled: false, Status: types.SkillStatusReady},
+	}
+	lister := listerFunc(func(_ context.Context, tenantID uint64, configID string) ([]*types.TenantSkillEntity, error) {
+		require.Equal(t, uint64(7), tenantID)
+		require.Equal(t, sandbox.HostSkillTargetID, configID)
+		return rows, nil
+	})
+	configID, got := hostSkillsForRun(context.Background(), lister,
+		installedTree{installed: map[string]bool{"pdf": true, "xlsx": true}}, 7)
+	require.Equal(t, sandbox.HostSkillTargetID, configID)
+	require.Len(t, got, 1)
+	require.Equal(t, "pdf", got[0].Name)
+}
+
+func desktopFixture(t *testing.T) *effectiveFixture {
+	t.Helper()
+	fx := newEffectiveFixture(t)
+	fx.configs.entity.Config.DesktopEnabled = true
+	return fx
+}
+
+func TestEffectiveTenantSkillsAddsTheBuiltinBrowserSkillOnDesktopConfigs(t *testing.T) {
+	got := desktopFixture(t).derive(context.Background())
+
+	require.ElementsMatch(t, []string{"ready-enabled", "second-ready", "agent-browser"}, skillNames(got))
+	builtin := got[len(got)-1]
+	require.True(t, builtin.Builtin)
+	require.Equal(t, uint64(7), builtin.TenantID)
+	require.Equal(t, "cfg-1", builtin.SandboxConfigID)
+	require.Contains(t, builtin.Instructions, "agent-browser open")
+}
+
+func TestEffectiveTenantSkillsOmitsTheBuiltinBrowserSkillWithoutADesktop(t *testing.T) {
+	got := newEffectiveFixture(t).derive(context.Background())
+
+	require.NotContains(t, skillNames(got), "agent-browser")
+}
+
+func TestEffectiveTenantSkillsOffersTheBuiltinWithoutASkillImage(t *testing.T) {
+	fx := desktopFixture(t)
+	fx.configs.entity.Config.SkillImage = nil
+
+	require.Equal(t, []string{"agent-browser"}, skillNames(fx.derive(context.Background())))
+}
+
+func TestEffectiveTenantSkillsKeepsTheBuiltinWhenTheListingFails(t *testing.T) {
+	fx := desktopFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.Equal(t, []string{"agent-browser"}, skillNames(fx.derive(ctx)))
+}
+
+func TestEffectiveTenantSkillsLetsAnInstalledSkillReplaceTheBuiltin(t *testing.T) {
+	fx := desktopFixture(t)
+	require.NoError(t, fx.skills.CreateSkill(context.Background(), &types.TenantSkillEntity{
+		ID: "sk-own", Name: "agent-browser", TenantID: 7, SandboxConfigID: "cfg-1",
+		Status: types.SkillStatusReady, Enabled: true,
+	}))
+
+	got := fx.derive(context.Background())
+
+	count := 0
+	for _, row := range got {
+		if row.Name == "agent-browser" {
+			count++
+			require.False(t, row.Builtin, "the administrator's own skill must win")
+		}
+	}
+	require.Equal(t, 1, count)
+}
+
+func TestListUsableSkillsIncludesTheBuiltinBrowserSkill(t *testing.T) {
+	fx := desktopFixture(t)
+	svc := &TenantSkillService{configs: fx.configs, skills: fx.skills}
+
+	require.Contains(t, skillNames(svc.ListUsableSkills(context.Background(), 7, "cfg-1")), "agent-browser")
+}
+
+func TestListUsableSkillsOnHostUsesDiskNotSnapshot(t *testing.T) {
+	repo := newInstallSkillRepo()
+	for _, row := range []*types.TenantSkillEntity{
+		{ID: "a", TenantID: 7, SandboxConfigID: "host", Name: "pdf", Enabled: true, Status: types.SkillStatusReady},
+		{ID: "b", TenantID: 7, SandboxConfigID: "host", Name: "docx", Enabled: true, Status: types.SkillStatusReady},
+		{ID: "c", TenantID: 7, SandboxConfigID: "host", Name: "xlsx", Enabled: false, Status: types.SkillStatusReady},
+	} {
+		require.NoError(t, repo.CreateSkill(context.Background(), row))
+	}
+	desktop := &TenantSkillService{
+		skills: repo,
+		host: HostSandboxManager{
+			Desktop:   true,
+			SkillTree: installedTree{installed: map[string]bool{"pdf": true, "xlsx": true}},
+		},
+	}
+	got := desktop.ListUsableSkills(context.Background(), 7, sandbox.HostSkillTargetID)
+	require.Len(t, got, 1)
+	require.Equal(t, "pdf", got[0].Name)
+
+	web := &TenantSkillService{skills: repo}
+	require.Empty(t, web.ListUsableSkills(context.Background(), 7, sandbox.HostSkillTargetID))
+	require.Empty(t, desktop.ListUsableSkills(context.Background(), 7, "cfg-1"))
+}

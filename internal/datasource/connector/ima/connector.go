@@ -50,6 +50,32 @@ func (c *Connector) ResolveResourceAncestors(
 	return []string{}, nil
 }
 
+// maxPaginationHops bounds every cursor-paginated loop in this file. A vendor
+// that keeps handing back a fresh cursor would otherwise keep the connector
+// (and the sync task holding it) spinning until the task deadline; the value
+// mirrors the guard Confluence and DingTalk already carry.
+const maxPaginationHops = 10000
+
+// nextPageCursor validates the progress of a cursor-paginated loop after page
+// `page` (1-based) has been fetched: a cursor handed back twice means the
+// vendor is repeating a page, and page >= maxPaginationHops means the listing
+// is unbounded. Both are reported instead of being retried forever, and the
+// hop cap is also logged because it is the one failure that looks like a
+// healthy, still-running sync from the outside.
+func nextPageCursor(
+	ctx context.Context, seen map[string]struct{}, cursor string, page int,
+) (string, error) {
+	if page >= maxPaginationHops {
+		logger.Warnf(ctx, "[IMA] pagination exceeded %d pages; aborting", maxPaginationHops)
+		return "", fmt.Errorf("pagination exceeded %d pages", maxPaginationHops)
+	}
+	if _, exists := seen[cursor]; exists {
+		return "", fmt.Errorf("pagination repeated next_cursor %q", cursor)
+	}
+	seen[cursor] = struct{}{}
+	return cursor, nil
+}
+
 // ListResources returns the flat list of knowledge bases the token can read.
 // parentID is honoured only for the "no children" contract — see the note on
 // Connector.ListResources in internal/datasource/connector.go.
@@ -80,7 +106,8 @@ func (c *Connector) ListResources(
 	var bases []kbLite
 
 	cursor := ""
-	for {
+	seenCursors := make(map[string]struct{})
+	for page := 1; ; page++ {
 		resp, err := cli.GetAddableKnowledgeBaseList(ctx, cursor, defaultPageSize)
 		if err != nil {
 			return nil, fmt.Errorf("get_addable_knowledge_base_list: %w", err)
@@ -91,13 +118,18 @@ func (c *Connector) ListResources(
 		if resp.IsEnd || resp.NextCursor == "" {
 			break
 		}
-		cursor = resp.NextCursor
+		next, err := nextPageCursor(ctx, seenCursors, resp.NextCursor, page)
+		if err != nil {
+			return nil, fmt.Errorf("get_addable_knowledge_base_list: %w", err)
+		}
+		cursor = next
 	}
 	logger.Infof(ctx, "[IMA] get_addable_knowledge_base_list returned %d knowledge bases", len(bases))
 
 	if len(bases) == 0 {
 		cursor = ""
-		for {
+		seenCursors = make(map[string]struct{})
+		for page := 1; ; page++ {
 			resp, err := cli.SearchKnowledgeBase(ctx, "", cursor, searchPageSize)
 			if err != nil {
 				return nil, fmt.Errorf("search_knowledge_base fallback: %w", err)
@@ -108,7 +140,11 @@ func (c *Connector) ListResources(
 			if resp.IsEnd || resp.NextCursor == "" {
 				break
 			}
-			cursor = resp.NextCursor
+			next, err := nextPageCursor(ctx, seenCursors, resp.NextCursor, page)
+			if err != nil {
+				return nil, fmt.Errorf("search_knowledge_base fallback: %w", err)
+			}
+			cursor = next
 		}
 		logger.Infof(ctx, "[IMA] search_knowledge_base fallback returned %d knowledge bases", len(bases))
 	}
@@ -246,11 +282,12 @@ func (c *Connector) walk(
 			return nil, nil, fmt.Errorf("list KB %s: %w", kbID, err)
 		}
 
-		// present holds every logical_key IMA listed this cycle; it drives
-		// delete detection. syncedLogical holds only the keys we actually
-		// resolved this cycle and is what gets persisted as the cursor, so a
-		// transient failure is retried next run rather than being remembered
-		// as "unchanged" forever.
+		var prevSet map[string]string
+		if incremental && prev != nil {
+			prevSet = prev.KBLogical[kbID]
+		}
+		// The full listing determines absence; the cursor tracks the last
+		// resolved version of each known document.
 		present := make(map[string]struct{}, len(files))
 		syncedLogical := make(map[string]string, len(files))
 		keys := make([]string, len(files))
@@ -266,23 +303,22 @@ func (c *Connector) walk(
 			key := keys[i]
 
 			// Incremental skip / replacement detection.
-			if incremental && prev != nil && prev.KBLogical != nil {
-				if prevSet, ok := prev.KBLogical[kbID]; ok {
-					if prevMediaID, seen := prevSet[key]; seen {
-						if prevMediaID == f.MediaID {
-							// Unchanged: carry the entry forward so it is not
-							// re-fetched next cycle either.
-							syncedLogical[key] = f.MediaID
-							continue
-						}
-						replaced++ // media_id changed → replacement, fall through to re-fetch
-					}
+			prevMediaID, seen := prevSet[key]
+			if seen {
+				if prevMediaID == f.MediaID {
+					syncedLogical[key] = prevMediaID
+					continue
 				}
+				replaced++
 			}
 
 			item, outcome := fetchOneMedia(ctx, cli, kbID, key, f, folderPath)
 			switch outcome {
 			case fetchOK:
+				// Ingestion derives the knowledge folder from FileName, not metadata.
+				if dir := types.NormalizeKnowledgeFolderPath(f.FolderPath); dir != "" && item.FileName != "" {
+					item.FileName = dir + "/" + item.FileName
+				}
 				syncedLogical[key] = f.MediaID
 				out = append(out, item)
 			case fetchSkipped:
@@ -290,9 +326,11 @@ func (c *Connector) walk(
 				// so we do not pay for get_media_info on every future sync.
 				syncedLogical[key] = f.MediaID
 			case fetchFailed:
-				// Transient: leave the key out of the cursor so the next run
-				// retries. `present` still contains it, so it is not mistaken
-				// for a deletion.
+				// Keep an existing document tracked for deletion, but retain
+				// its old version so a replacement is still retried.
+				if seen {
+					syncedLogical[key] = prevMediaID
+				}
 				failed++
 			}
 		}
@@ -301,18 +339,14 @@ func (c *Connector) walk(
 		// from the listing, so neither a same-name replacement (media_id churns
 		// but logical_key stays) nor a failed download fires a spurious delete.
 		deleted := 0
-		if incremental && prev != nil && prev.KBLogical != nil {
-			if prevSet, ok := prev.KBLogical[kbID]; ok {
-				for prevKey := range prevSet {
-					if _, still := present[prevKey]; !still {
-						out = append(out, types.FetchedItem{
-							ExternalID:       prevKey,
-							IsDeleted:        true,
-							SourceResourceID: kbID,
-						})
-						deleted++
-					}
-				}
+		for prevKey := range prevSet {
+			if _, still := present[prevKey]; !still {
+				out = append(out, types.FetchedItem{
+					ExternalID:       prevKey,
+					IsDeleted:        true,
+					SourceResourceID: kbID,
+				})
+				deleted++
 			}
 		}
 
@@ -356,7 +390,8 @@ func listAllKBFiles(
 		stack = stack[:len(stack)-1]
 
 		cursor := ""
-		for {
+		seenCursors := make(map[string]struct{})
+		for page := 1; ; page++ {
 			resp, err := cli.GetKnowledgeList(ctx, kbID, cur.folderID, cursor, defaultPageSize)
 			if err != nil {
 				return nil, nil, err
@@ -384,10 +419,18 @@ func listAllKBFiles(
 					FolderPath:    cur.path,
 				})
 			}
-			if resp.IsEnd || resp.NextCursor == "" {
+			if resp.IsEnd {
 				break
 			}
-			cursor = resp.NextCursor
+			if resp.NextCursor == "" {
+				// A partial listing cannot prove that missing documents were removed.
+				return nil, nil, fmt.Errorf("get_knowledge_list: missing next_cursor on a non-final page")
+			}
+			next, err := nextPageCursor(ctx, seenCursors, resp.NextCursor, page)
+			if err != nil {
+				return nil, nil, fmt.Errorf("get_knowledge_list: %w", err)
+			}
+			cursor = next
 		}
 	}
 	return out, folderPath, nil
@@ -419,8 +462,11 @@ func fetchNote(
 		return types.FetchedItem{}, fetchFailed
 	}
 	if strings.TrimSpace(content) == "" {
-		logger.Infof(ctx, "[IMA] note %s (title=%q) is empty, skipping", noteID, f.Title)
-		return types.FetchedItem{}, fetchSkipped
+		// A cleared note still exists. Keep its title as content so ingestion
+		// replaces the stale body instead of silently acknowledging the edit:
+		// skipping here would leave the old text indexed forever.
+		logger.Infof(ctx, "[IMA] note %s (title=%q) is empty, syncing its title only", noteID, f.Title)
+		content = "# " + f.Title + "\n"
 	}
 
 	fileName := datasource.SanitizeFileName(f.Title)

@@ -5,12 +5,52 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
+
+func TestReadDocumentCitationIdentitySurvivesClientAndHistoryCompaction(t *testing.T) {
+	knowledge := &types.Knowledge{
+		ID: "doc-1", KnowledgeBaseID: "kb-1", Title: "Proposal.pptx", FileName: "Proposal.pptx",
+	}
+	rows := []readChunkRow{
+		{chunk: &types.Chunk{ID: "chunk-1", Content: "First body"}},
+		{chunk: &types.Chunk{
+			ID: "chunk-2", Content: "Cited body",
+			SourceLocators: types.SourceLocators{{Type: types.SourceLocatorSlide, Slide: 8}},
+		}},
+	}
+	data := (&ReadDocumentTool{}).buildData(knowledge, 2, rows)
+	result := &types.ToolResult{Success: true, Data: data, Output: "full model-only output"}
+	steps := []types.AgentStep{{ToolCalls: []types.ToolCall{{Name: ToolReadDocument, Result: result}}}}
+	stored := SanitizeAgentStepsForStorage(steps)[0].ToolCalls[0].Result
+	for name, compact := range map[string]map[string]interface{}{
+		"live":    SanitizeToolResultForClient(ToolReadDocument, result),
+		"history": stored.Data,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if compact["knowledge_id"] != "doc-1" || compact["knowledge_base_id"] != "kb-1" ||
+				compact["source_chunk_id"] != "chunk-2" {
+				t.Fatalf("lost citation provenance: %#v", compact)
+			}
+			if !reflect.DeepEqual(compact["chunk_ids"], []string{"chunk-1", "chunk-2"}) {
+				t.Fatalf("lost cited chunk IDs: %#v", compact["chunk_ids"])
+			}
+			if _, exists := compact["chunks"]; exists {
+				t.Fatal("chunk bodies should still be omitted")
+			}
+		})
+	}
+	if len(data["chunks"].([]map[string]interface{})) != 2 || result.Output != "full model-only output" {
+		t.Fatal("compaction must not mutate the full model result")
+	}
+}
 
 // ---- fakes -----------------------------------------------------------------
 
@@ -329,6 +369,72 @@ func TestReadDocumentQueryStopsAtOutputBudget(t *testing.T) {
 	}
 }
 
+func TestReadDocumentQueryKeepsRenderedPageWithinDefaultBudget(t *testing.T) {
+	tool, repo := newReadDocumentFixture(4)
+	repo.ordered[0].Content = "needle first " + strings.Repeat("a", 6000)
+	repo.ordered[1].Content = "needle second " + strings.Repeat("b", 6500)
+	repo.ordered[2].Content = "worksheet notes " + strings.Repeat("c", 5900)
+	repo.ordered[3].Content = "needle final " + strings.Repeat("d", 6900)
+
+	first, err := tool.Execute(t.Context(), json.RawMessage(`{"id":"doc-1","query":"needle"}`))
+	if err != nil || !first.Success {
+		t.Fatalf("query failed: %v", err)
+	}
+	rendered := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolReadDocument, first)
+	size := utf8.RuneCountInString(rendered)
+	t.Logf("first model page: %d runes, budget: %d", size, DefaultMaxToolOutput)
+	if size > DefaultMaxToolOutput {
+		t.Errorf("model received %d runes, budget is %d", size, DefaultMaxToolOutput)
+	}
+	if first.Data["match_count"] != 2 || first.Data["next_offset"] != 3 || first.Data["truncated"] != true {
+		t.Fatalf("expected two matches and offset 3, got match_count=%v next_offset=%v truncated=%v",
+			first.Data["match_count"], first.Data["next_offset"], first.Data["truncated"])
+	}
+
+	next, err := tool.Execute(t.Context(), json.RawMessage(`{"id":"doc-1","query":"needle","offset":3}`))
+	if err != nil || !next.Success || next.Data["match_count"] != 1 || next.Data["truncated"] != false {
+		t.Fatalf("resume failed: %+v, err=%v", next, err)
+	}
+	rendered = modelcontext.NewRegistry(true).ModelToolResultForTool(ToolReadDocument, next)
+	if !strings.Contains(rendered, "needle final") {
+		t.Fatal("resumed page lost the deferred match")
+	}
+}
+
+func TestReadDocumentQueryOmitsNeighborsThatWouldOverflow(t *testing.T) {
+	tool, repo := newReadDocumentFixture(3)
+	repo.ordered[0].Content = strings.Repeat("图", 1400)
+	repo.ordered[1].Content = "needle: relevant worksheet answer"
+	repo.ordered[2].Content = strings.Repeat("表", 1400)
+
+	ctx := WithOutputBudget(t.Context(), 1500)
+	result, err := tool.Execute(ctx, json.RawMessage(`{"id":"doc-1","query":"needle"}`))
+	if err != nil || !result.Success {
+		t.Fatalf("query failed: %v", err)
+	}
+	if got := chunkIDsFromData(t, result.Data); !reflect.DeepEqual(got, []string{"chunk-1"}) {
+		t.Fatalf("got %v, expected only the matching chunk", got)
+	}
+	if result.Data["match_count"] != 1 || result.Data["truncated"] != false {
+		t.Fatalf("omitted context should not mark a complete match list as truncated")
+	}
+}
+
+func TestReadDocumentQueryAdvancesPastOversizedFirstMatch(t *testing.T) {
+	tool, repo := newReadDocumentFixture(2)
+	repo.ordered[0].Content = "needle " + strings.Repeat("a", 2000)
+	repo.ordered[1].Content = "needle second"
+
+	ctx := WithOutputBudget(t.Context(), 1500)
+	result, err := tool.Execute(ctx, json.RawMessage(`{"id":"doc-1","query":"needle"}`))
+	if err != nil || !result.Success || result.Data["match_count"] != 1 || result.Data["next_offset"] != 1 {
+		t.Fatalf("oversized first match must advance the cursor: %+v, err=%v", result, err)
+	}
+	if got := chunkIDsFromData(t, result.Data); !reflect.DeepEqual(got, []string{"chunk-0"}) {
+		t.Fatalf("got %v, expected the first match", got)
+	}
+}
+
 func TestReadDocumentPageStopsAtOutputBudget(t *testing.T) {
 	tool, repo := newReadDocumentFixture(12)
 	for _, c := range repo.ordered {
@@ -523,5 +629,141 @@ func TestReadDocumentFAQChunkExposesQuestion(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "<answer>Hold the button.</answer>") {
 		t.Fatalf("output = %s", res.Output)
+	}
+}
+
+// A truncated query result says where to continue, and offset resumes the
+// scan there; matches past the cap used to be reachable only by paging the
+// whole document.
+func TestReadDocumentQueryContinuesFromNextOffset(t *testing.T) {
+	tool, repo := newReadDocumentFixture(12)
+	for _, c := range repo.ordered {
+		c.Content = "needle " + strings.Repeat("x", 400)
+	}
+	ctx := WithOutputBudget(context.Background(), 1500)
+	first, err := tool.Execute(ctx, json.RawMessage(`{"id":"doc-1","query":"needle"}`))
+	if err != nil || !first.Success || first.Data["truncated"] != true {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	next, ok := first.Data["next_offset"].(int)
+	if !ok || next <= 0 || next >= 12 {
+		t.Fatalf("next_offset = %v", first.Data["next_offset"])
+	}
+	firstIDs := chunkIDsFromData(t, first.Data)
+
+	second, err := tool.Execute(ctx, json.RawMessage(fmt.Sprintf(`{"id":"doc-1","query":"needle","offset":%d}`, next)))
+	if err != nil || !second.Success {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	secondIDs := chunkIDsFromData(t, second.Data)
+	if len(secondIDs) == 0 {
+		t.Fatal("continuation returned nothing")
+	}
+	for _, id := range secondIDs {
+		for _, seen := range firstIDs {
+			if id == seen && id != secondIDs[0] {
+				t.Fatalf("continuation repeated %s: first=%v second=%v", id, firstIDs, secondIDs)
+			}
+		}
+	}
+}
+
+func TestReadDocumentQueryCountsEscapedMarkupAndContinues(t *testing.T) {
+	tool, repo := newReadDocumentFixture(3)
+	repo.ordered[0].Content = "needle first " + strings.Repeat("<td>&</td>", 700)
+	repo.ordered[1].Content = "needle second " + strings.Repeat("<td>&</td>", 700)
+	repo.ordered[2].Content = "needle final"
+
+	var found []string
+	offset := 0
+	for {
+		input := json.RawMessage(fmt.Sprintf(`{"id":"doc-1","query":"needle","offset":%d}`, offset))
+		result, err := tool.Execute(t.Context(), input)
+		if err != nil || !result.Success {
+			t.Fatalf("query failed at offset %d: %v", offset, err)
+		}
+		output := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolReadDocument, result)
+		size := utf8.RuneCountInString(output)
+		t.Logf("offset %d rendered %d runes, next offset: %v", offset, size, result.Data["next_offset"])
+		if size > DefaultMaxToolOutput {
+			t.Fatalf("model received %d runes at offset %d, budget is %d", size, offset, DefaultMaxToolOutput)
+		}
+		for _, row := range result.Data["chunks"].([]map[string]interface{}) {
+			if row["role"] == "match" {
+				found = append(found, row["chunk_id"].(string))
+			}
+		}
+		next, ok := result.Data["next_offset"].(int)
+		if !ok {
+			break
+		}
+		if next <= offset || next >= len(repo.ordered) {
+			t.Fatalf("cursor must advance within the document, offset=%d next=%d", offset, next)
+		}
+		offset = next
+	}
+	if want := []string{"chunk-0", "chunk-1", "chunk-2"}; !reflect.DeepEqual(found, want) {
+		t.Fatalf("match pagination got %v, want %v", found, want)
+	}
+}
+
+func TestReadDocumentQueryBudgetsFAQAnswersAcrossScanPages(t *testing.T) {
+	tool, repo := newReadDocumentFixture(readDocumentScanPageSize + 2)
+	first := readDocumentScanPageSize - 2
+	for i, chunk := range repo.ordered {
+		chunk.ChunkType = types.ChunkTypeFAQ
+		question := fmt.Sprintf("Question %d", i)
+		answer := "Short answer"
+		if i >= first {
+			question = "needle " + question
+			answer = strings.Repeat("a", 6600)
+		}
+		// Question-only indexing excludes the answer from Chunk.Content.
+		chunk.Content = "Q: " + question + "\n"
+		if err := chunk.SetFAQMetadata(&types.FAQChunkMetadata{
+			StandardQuestion: question,
+			Answers:          []string{answer},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var matched []string
+	var offsets []int
+	for offset := 0; ; {
+		args := json.RawMessage(fmt.Sprintf(`{"id":"doc-1","query":"needle","offset":%d}`, offset))
+		res, err := tool.Execute(t.Context(), args)
+		if err != nil || !res.Success {
+			t.Fatalf("offset %d: %v", offset, err)
+		}
+		rendered := modelcontext.NewRegistry(true).ModelToolResultForTool(ToolReadDocument, res)
+		size := utf8.RuneCountInString(rendered)
+		t.Logf("offset=%d rendered=%d next_offset=%v", offset, size, res.Data["next_offset"])
+		if size > DefaultMaxToolOutput {
+			t.Fatalf("offset %d: rendered %d runes over budget %d", offset, size, DefaultMaxToolOutput)
+		}
+		for _, row := range res.Data["chunks"].([]map[string]interface{}) {
+			if row["role"] == "match" {
+				matched = append(matched, row["faq_id"].(string))
+			}
+		}
+		next, ok := res.Data["next_offset"].(int)
+		if !ok {
+			break
+		}
+		if next <= offset || next >= len(repo.ordered) {
+			t.Fatalf("offset %d did not advance to a valid position: %d", offset, next)
+		}
+		offsets = append(offsets, next)
+		offset = next
+	}
+
+	var want []string
+	for _, chunk := range repo.ordered[first:] {
+		want = append(want, chunk.ID)
+	}
+	if !reflect.DeepEqual(matched, want) || len(offsets) == 0 || offsets[0] != readDocumentScanPageSize {
+		t.Fatalf("matches=%v (want %v), cursors=%v (want first cursor %d)",
+			matched, want, offsets, readDocumentScanPageSize)
 	}
 }

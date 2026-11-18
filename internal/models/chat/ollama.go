@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Tencent/WeKnora/internal/models/api"
-
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/types"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -46,6 +45,9 @@ func (c *OllamaChat) convertMessages(messages []Message) []ollamaapi.Message {
 		}
 		if msg.Role == "tool" {
 			msgOllama.ToolName = msg.Name
+			if _, err := strconv.Atoi(msg.ToolCallID); err != nil {
+				msgOllama.ToolCallID = msg.ToolCallID
+			}
 		}
 		// The agent builds multimodal turns as MultiContent parts, the shape
 		// every remote protocol prefers, and only the older callers fill
@@ -124,6 +126,11 @@ func (c *OllamaChat) buildChatRequest(messages []Message, opts *ChatOptions, isS
 		Options:  make(map[string]interface{}),
 	}
 
+	// Keep request-scoped notices out of the system prefix and stored history.
+	if opts != nil && opts.RuntimeNotice != "" {
+		chatReq.Messages = append(chatReq.Messages, ollamaapi.Message{Role: "user", Content: opts.RuntimeNotice})
+	}
+
 	// 添加可选参数
 	if opts != nil {
 		chatReq.Options["temperature"] = opts.Temperature
@@ -165,6 +172,7 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 	var responseContent string
 	var toolCalls []types.LLMToolCall
 	var promptTokens, completionTokens int
+	var finishReason string
 
 	// 使用 Ollama 客户端发送请求
 	err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
@@ -174,6 +182,11 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 			responseContent = resp.Message.Thinking
 		}
 		toolCalls = c.toolCallTo(resp.Message.ToolCalls)
+		// done_reason 是 "stop" / "length" 等；不透传的话调用方分不清拒答和
+		// num_predict 打满导致的截断（图谱抽取据此决定跳过还是重试）。
+		if resp.DoneReason != "" {
+			finishReason = resp.DoneReason
+		}
 
 		// 获取token计数。eval_count 本身就是回答的 token 数，不含 prompt
 		// (https://github.com/ollama/ollama/blob/main/docs/api.md)，所以不能再
@@ -198,9 +211,10 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 	api.LogUsage(ctx, c.modelName, &usage)
 
 	return &types.ChatResponse{
-		Content:   responseContent,
-		ToolCalls: toolCalls,
-		Usage:     usage,
+		Content:      responseContent,
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
+		Usage:        usage,
 	}, nil
 }
 
@@ -229,6 +243,7 @@ func (c *OllamaChat) ChatStream(
 		defer close(streamChan)
 
 		var thinking api.ThinkingEmitter
+		var toolCalls []ollamaapi.ToolCall
 		err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
 			// 发送思考内容（支持 Qwen3、DeepSeek 等推理模型）
 			if resp.Message.Thinking != "" {
@@ -246,6 +261,7 @@ func (c *OllamaChat) ChatStream(
 			}
 
 			if len(resp.Message.ToolCalls) > 0 {
+				toolCalls = append(toolCalls, resp.Message.ToolCalls...)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeToolCall,
 					ToolCalls:    c.toolCallTo(resp.Message.ToolCalls),
@@ -274,7 +290,7 @@ func (c *OllamaChat) ChatStream(
 								Done:         false,
 								Data: map[string]interface{}{
 									"source":       "thinking_tool",
-									"tool_call_id": tooli2s(tc.Function.Index),
+									"tool_call_id": ollamaToolCallID(tc),
 								},
 							}
 						}
@@ -293,10 +309,16 @@ func (c *OllamaChat) ChatStream(
 					usage.MarkPromptCacheUnsupported()
 				}
 				api.LogUsage(ctx, c.modelName, usage)
+				// Ollama sends batches of complete calls. The Agent uses the
+				// last nonempty snapshot, so finish with every call in order.
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Done:         true,
 					Usage:        usage,
+					ToolCalls:    c.toolCallTo(toolCalls),
+					// 与非流式分支一致：透传 done_reason，否则 num_predict 打满
+					// 的截断在流式里看起来像正常结束。
+					FinishReason: resp.DoneReason,
 				}
 			}
 
@@ -361,14 +383,22 @@ func (c *OllamaChat) toolCallFrom(toolCalls []ToolCall) []ollamaapi.ToolCall {
 		return nil
 	}
 	ollamaToolCalls := make([]ollamaapi.ToolCall, 0, len(toolCalls))
-	for _, tc := range toolCalls {
+	for i, tc := range toolCalls {
 		args := ollamaapi.NewToolCallFunctionArguments()
 		if tc.Function.Arguments != "" {
 			_ = args.UnmarshalJSON([]byte(tc.Function.Arguments))
 		}
+		// Numeric IDs came from older adapters that used the function index.
+		// Native Ollama IDs must instead travel in the wire ID field.
+		index, err := strconv.Atoi(tc.ID)
+		var id string
+		if err != nil {
+			index, id = i, tc.ID
+		}
 		ollamaToolCalls = append(ollamaToolCalls, ollamaapi.ToolCall{
+			ID: id,
 			Function: ollamaapi.ToolCallFunction{
-				Index:     tools2i(tc.ID),
+				Index:     index,
 				Name:      tc.Function.Name,
 				Arguments: args,
 			},
@@ -386,7 +416,7 @@ func (c *OllamaChat) toolCallTo(ollamaToolCalls []ollamaapi.ToolCall) []types.LL
 	for _, tc := range ollamaToolCalls {
 		argsBytes, _ := json.Marshal(tc.Function.Arguments)
 		toolCalls = append(toolCalls, types.LLMToolCall{
-			ID:   tooli2s(tc.Function.Index),
+			ID:   ollamaToolCallID(tc),
 			Type: "function",
 			Function: types.FunctionCall{
 				Name:      tc.Function.Name,
@@ -397,11 +427,9 @@ func (c *OllamaChat) toolCallTo(ollamaToolCalls []ollamaapi.ToolCall) []types.LL
 	return toolCalls
 }
 
-func tooli2s(i int) string {
-	return strconv.Itoa(i)
-}
-
-func tools2i(s string) int {
-	i, _ := strconv.Atoi(s)
-	return i
+func ollamaToolCallID(call ollamaapi.ToolCall) string {
+	if call.ID != "" {
+		return call.ID
+	}
+	return strconv.Itoa(call.Function.Index)
 }

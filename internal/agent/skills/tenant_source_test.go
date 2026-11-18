@@ -354,3 +354,42 @@ func zipArchive(t *testing.T, files map[string]string) []byte {
 	require.NoError(t, writer.Close())
 	return buf.Bytes()
 }
+
+func TestTenantSkillSourceAtUsesTheGivenRoot(t *testing.T) {
+	rows := []*types.TenantSkillEntity{{Name: "pdf", Status: types.SkillStatusReady, Enabled: true}}
+	src := NewTenantSkillSourceAt("/Users/dev/.weknora/skills", rows, nil)
+	meta, err := src.DiscoverSkills()
+	require.NoError(t, err)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf", meta[0].BasePath)
+	script, err := src.RemoteScriptPath("pdf", "scripts/run.py")
+	require.NoError(t, err)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf/scripts/run.py", script)
+
+	legacy := NewTenantSkillSource(rows, nil)
+	dir, err := legacy.GetSkillBasePath("pdf")
+	require.NoError(t, err)
+	require.Equal(t, sandbox.SkillsImageRoot+"/pdf", dir)
+}
+
+func TestBuiltinSkillRowsNeverTouchABundle(t *testing.T) {
+	row := &types.TenantSkillEntity{
+		ID: "builtin:agent-browser", Name: "agent-browser", Description: "d", Instructions: "body",
+		Enabled: true, Status: types.SkillStatusReady, Builtin: true,
+	}
+	src := NewTenantSkillSource([]*types.TenantSkillEntity{row},
+		func(*types.TenantSkillEntity) ([]byte, error) {
+			t.Fatal("a builtin skill has no stored bundle; fetching one must not happen")
+			return nil, nil
+		})
+
+	files, err := src.ListSkillFiles("agent-browser")
+	require.NoError(t, err)
+	require.Equal(t, []string{SkillFileName}, files)
+
+	_, err = src.LoadSkillFile("agent-browser", "references/more.md")
+	require.ErrorContains(t, err, "file not found")
+
+	skill, err := src.LoadSkillInstructions("agent-browser")
+	require.NoError(t, err)
+	require.Equal(t, "body", skill.Instructions)
+}

@@ -2,6 +2,8 @@ package yuque
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,11 +14,12 @@ import (
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
-// TestMain whitelists loopback for the httptest servers and the default base
-// host so parseYuqueConfig does not resolve www.yuque.com over live DNS during
-// a unit test. Production keeps the default strict SSRF policy.
+const testYuqueCustomHost = "company.yuque.example"
+
+// TestMain whitelists loopback for the httptest servers and the base URLs
+// used by config tests so parsing does not require live DNS.
 func TestMain(m *testing.M) {
-	_ = os.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost,www.yuque.com")
+	_ = os.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost,www.yuque.com,"+testYuqueCustomHost)
 	secutils.ResetSSRFWhitelistForTest()
 	os.Exit(m.Run())
 }
@@ -299,6 +302,144 @@ func TestConnector_FetchAll_SkipsUnsupportedFormats(t *testing.T) {
 	}
 }
 
+func TestConnector_FetchAll_SkipsEmptyBodiesAndHTMLShells(t *testing.T) {
+	f := newFakeYuque()
+	defer f.Close()
+	f.handleJSON("/api/v2/repos/14/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 601, Type: "Doc", Status: "1", Title: "Empty", Slug: "empty", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 602, Type: "Doc", Status: "1", Title: "Shell", Slug: "shell", ContentUpdatedAt: "2026-04-20T11:00:00Z"},
+		{ID: 603, Type: "Doc", Status: "1", Title: "Real", Slug: "real", ContentUpdatedAt: "2026-04-20T12:00:00Z"},
+		{ID: 604, Type: "Doc", Status: "1", Title: "BOM Empty", Slug: "bom-empty"},
+		{ID: 605, Type: "Doc", Status: "1", Title: "BOM Shell", Slug: "bom-shell"},
+		{ID: 606, Type: "Doc", Status: "1", Title: "BOM Real", Slug: "bom-real"},
+		{ID: 607, Type: "Doc", Status: "1", Title: "HTML Example", Slug: "html-example"},
+	}})
+	emptyBody := " \n\t"
+	f.handleJSON("/api/v2/repos/docs/601", 200, v2DocDetailResponse{
+		Data: v2DocDetail{
+			ID: 601, Title: "Empty", Format: "markdown", Body: emptyBody, Status: "1",
+			ContentUpdatedAt: "2026-04-20T10:00:00Z",
+		},
+	})
+	shellBody := "<!doctype html>\n<html data-kumuhana=\"default\">" +
+		"<head><script src=\"/app.js\"></script></head></html>"
+	f.handleJSON("/api/v2/repos/docs/602", 200, v2DocDetailResponse{
+		Data: v2DocDetail{
+			ID: 602, Title: "Shell", Format: "markdown", Body: shellBody, Status: "1",
+			ContentUpdatedAt: "2026-04-20T11:00:00Z",
+		},
+	})
+	f.handleJSON("/api/v2/repos/docs/603", 200, v2DocDetailResponse{
+		Data: v2DocDetail{
+			ID: 603, Title: "Real", Format: "markdown", Body: "# real", Status: "1",
+			ContentUpdatedAt: "2026-04-20T12:00:00Z",
+		},
+	})
+	bomMarkdown := "\ufeff \n# real Markdown"
+	customElementMarkdown := "<html-example>Example</html-example>\n\n# Usage"
+	for _, doc := range []struct {
+		id   int64
+		body string
+	}{
+		{604, " \ufeff \n\t"},
+		{605, "\ufeff \n<!DOCTYPE html><html></html>"},
+		{606, bomMarkdown},
+		{607, customElementMarkdown},
+	} {
+		f.handleJSON(fmt.Sprintf("/api/v2/repos/docs/%d", doc.id), 200, v2DocDetailResponse{
+			Data: v2DocDetail{ID: doc.id, Format: "markdown", Body: doc.body, Status: "1"},
+		})
+	}
+
+	items, err := NewConnector().FetchAll(context.Background(), makeDSConfig(f, []string{"14"}), []string{"14"})
+	if err != nil {
+		t.Fatalf("FetchAll: %v", err)
+	}
+	if len(items) != 7 {
+		t.Fatalf("want 7 items (4 skips + 3 docs), got %d: %+v", len(items), items)
+	}
+	wantReasons := map[string]string{
+		"601": "empty document body", "602": "document body is an HTML page shell",
+		"604": "empty document body", "605": "document body is an HTML page shell",
+	}
+	skipped := map[string]*types.FetchedItem{}
+	foundBOMMarkdown := false
+	foundCustomElementMarkdown := false
+	for i := range items {
+		if _, ok := wantReasons[items[i].ExternalID]; ok {
+			skipped[items[i].ExternalID] = &items[i]
+		}
+		if items[i].ExternalID == "606" {
+			foundBOMMarkdown = true
+			if string(items[i].Content) != bomMarkdown {
+				t.Errorf("BOM Markdown content = %q, want %q", items[i].Content, bomMarkdown)
+			}
+		}
+		if items[i].ExternalID == "607" {
+			foundCustomElementMarkdown = true
+			if string(items[i].Content) != customElementMarkdown {
+				t.Errorf("custom-element Markdown content = %q, want %q", items[i].Content, customElementMarkdown)
+			}
+		}
+	}
+	if !foundBOMMarkdown {
+		t.Fatal("missing BOM Markdown document")
+	}
+	if !foundCustomElementMarkdown {
+		t.Fatal("missing custom-element Markdown document")
+	}
+	for id, wantReason := range wantReasons {
+		it := skipped[id]
+		if it == nil {
+			t.Fatalf("missing skip placeholder for %s", id)
+		}
+		// The URL must be empty: a placeholder with a URL falls through to the
+		// generic URL ingestion path, which downloads the Yuque SPA shell.
+		if it.URL != "" {
+			t.Errorf("item %s URL = %q, want empty so the sync cannot download the web page", id, it.URL)
+		}
+		if len(it.Content) != 0 {
+			t.Errorf("item %s Content = %q, want empty", id, it.Content)
+		}
+		if it.Metadata["skip_reason"] != wantReason {
+			t.Errorf("item %s skip_reason = %q, want %q", id, it.Metadata["skip_reason"], wantReason)
+		}
+	}
+}
+
+func TestIsHTMLPageShell(t *testing.T) {
+	shells := []string{
+		"<!doctype html><html></html>",
+		"  \n<!DOCTYPE HTML>\n<html></html>",
+		"\ufeff<html data-kumuhana=\"default\"></html>",
+		"\ufeff \n<html data-kumuhana=\"default\"></html>",
+		" \n\ufeff \t<!DOCTYPE HTML>\n<html></html>",
+		"<html><head><script src=\"/app.js\"></script></head></html>",
+		"<HTML\nlang=\"zh\"></HTML>",
+		"<!doctype html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><html></html>",
+	}
+	for _, body := range shells {
+		if !isHTMLPageShell(body) {
+			t.Errorf("isHTMLPageShell(%q) = false, want true", body)
+		}
+	}
+	markdown := []string{
+		"# Title",
+		"\ufeff \n# Title",
+		"\ufeff \n<div>inline HTML is allowed in Markdown</div>",
+		"<div>inline HTML is allowed in Markdown</div>",
+		"```html\n<!doctype html>\n```",
+		"<!-- a comment before prose -->\n\n# Title",
+		"<html-example>Example</html-example>\n\n# Usage",
+		"<!doctype html-example>\n\n# Usage",
+	}
+	for _, body := range markdown {
+		if isHTMLPageShell(body) {
+			t.Errorf("isHTMLPageShell(%q) = true, want false", body)
+		}
+	}
+}
+
 func TestConnector_FetchAll_SkipsNonDocTypes(t *testing.T) {
 	f := newFakeYuque()
 	defer f.Close()
@@ -511,5 +652,174 @@ func TestConnector_FetchAll_FileNamePolicy(t *testing.T) {
 				t.Fatalf("title = %q, filename = %q; want %q, %q", items[0].Title, items[0].FileName, tt.title, tt.want)
 			}
 		})
+	}
+}
+
+// Regression for Tencent/WeKnora#3690: when an existing doc's detail fetch
+// fails after its content changed, the incremental cursor must keep the doc's
+// previously synced version instead of acknowledging the new one — otherwise
+// every later sync sees the doc as unchanged and never retries the fetch.
+func TestConnector_FetchIncremental_DetailFailureDoesNotAckVersion(t *testing.T) {
+	// First sync: docs 1 and 2, both at t0.
+	f1 := newFakeYuque()
+	f1.handleJSON("/api/v2/repos/12/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 2, Type: "Doc", Status: "1", Title: "B", Slug: "b", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+	}})
+	f1.handleJSON("/api/v2/repos/docs/1", 200, v2DocDetailResponse{Data: v2DocDetail{
+		ID: 1, Title: "A", Body: "a", Status: "1", ContentUpdatedAt: "2026-04-20T10:00:00Z",
+	}})
+	f1.handleJSON("/api/v2/repos/docs/2", 200, v2DocDetailResponse{Data: v2DocDetail{
+		ID: 2, Title: "B", Body: "b", Status: "1", ContentUpdatedAt: "2026-04-20T10:00:00Z",
+	}})
+
+	_, cursor1, err := NewConnector().FetchIncremental(context.Background(), makeDSConfig(f1, []string{"12"}), nil)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	f1.Close()
+
+	// Second sync: doc 2 changed to t1 but its detail endpoint fails (mixed
+	// success/failure — doc 1 is unchanged, so the batch is not all-failed).
+	f2 := newFakeYuque()
+	f2.handleJSON("/api/v2/repos/12/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 2, Type: "Doc", Status: "1", Title: "B2", Slug: "b", ContentUpdatedAt: "2026-04-20T12:00:00Z"},
+	}})
+	f2.mux.HandleFunc("/api/v2/repos/docs/2", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest) // 4xx is non-retriable, bubbles up as an error
+		_, _ = w.Write([]byte(`{"message":"broken"}`))
+	})
+
+	items2, cursor2, err := NewConnector().FetchIncremental(
+		context.Background(), makeDSConfig(f2, []string{"12"}), cursor1)
+	if err != nil {
+		t.Fatalf("second sync must not fail on a single detail error, got %v", err)
+	}
+	f2.Close()
+
+	var placeholder *types.FetchedItem
+	for i := range items2 {
+		if items2[i].Metadata["error"] != "" && items2[i].ExternalID == "2" {
+			placeholder = &items2[i]
+		}
+	}
+	if placeholder == nil {
+		t.Fatalf("expected an error placeholder for doc 2, got %+v", items2)
+	}
+
+	// The cursor must still hold doc 2's previously synced version (t0), not
+	// the failed t1: acknowledging t1 hid the doc from all future syncs (#3690).
+	var cur2 yuqueCursor
+	if b, merr := json.Marshal(cursor2.ConnectorCursor); merr != nil {
+		t.Fatalf("encode cursor: %v", merr)
+	} else if uerr := json.Unmarshal(b, &cur2); uerr != nil {
+		t.Fatalf("decode cursor: %v", uerr)
+	}
+	if got := cur2.BookDocTimes["12"]["2"]; got != "2026-04-20T10:00:00Z" {
+		t.Fatalf("cursor must keep doc 2's previous version after a failed detail fetch, got %q", got)
+	}
+
+	// Third sync, endpoint recovered: doc 2 must be re-fetched because its
+	// cursor entry (t0) still differs from the listing (t1).
+	f3 := newFakeYuque()
+	defer f3.Close()
+	f3.handleJSON("/api/v2/repos/12/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 2, Type: "Doc", Status: "1", Title: "B2", Slug: "b", ContentUpdatedAt: "2026-04-20T12:00:00Z"},
+	}})
+	f3.handleJSON("/api/v2/repos/docs/2", 200, v2DocDetailResponse{Data: v2DocDetail{
+		ID: 2, Title: "B2", Body: "b2 recovered", Status: "1", ContentUpdatedAt: "2026-04-20T12:00:00Z",
+	}})
+
+	items3, _, err := NewConnector().FetchIncremental(context.Background(), makeDSConfig(f3, []string{"12"}), cursor2)
+	if err != nil {
+		t.Fatalf("third sync: %v", err)
+	}
+	if len(items3) != 1 || items3[0].ExternalID != "2" {
+		t.Fatalf("expected recovered doc 2 to be re-fetched, got %+v", items3)
+	}
+	if string(items3[0].Content) != "b2 recovered" {
+		t.Errorf("expected recovered body, got %q", string(items3[0].Content))
+	}
+}
+
+// Regression for Tencent/WeKnora#3690 (new-doc variant): a newly listed doc
+// whose detail fetch fails must not enter the cursor at all, so the next sync
+// still treats it as new and ingests it.
+func TestConnector_FetchIncremental_NewDocDetailFailureNotAcknowledged(t *testing.T) {
+	// First sync: doc 1 only.
+	f1 := newFakeYuque()
+	f1.handleJSON("/api/v2/repos/13/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+	}})
+	f1.handleJSON("/api/v2/repos/docs/1", 200, v2DocDetailResponse{Data: v2DocDetail{
+		ID: 1, Title: "A", Body: "a", Status: "1", ContentUpdatedAt: "2026-04-20T10:00:00Z",
+	}})
+
+	_, cursor1, err := NewConnector().FetchIncremental(context.Background(), makeDSConfig(f1, []string{"13"}), nil)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	f1.Close()
+
+	// Second sync: new doc 2 appears (t1) but its detail fetch fails.
+	f2 := newFakeYuque()
+	f2.handleJSON("/api/v2/repos/13/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 2, Type: "Doc", Status: "1", Title: "New", Slug: "new", ContentUpdatedAt: "2026-04-20T12:00:00Z"},
+	}})
+	f2.mux.HandleFunc("/api/v2/repos/docs/2", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest) // 4xx is non-retriable, bubbles up as an error
+		_, _ = w.Write([]byte(`{"message":"broken"}`))
+	})
+
+	items2, cursor2, err := NewConnector().FetchIncremental(
+		context.Background(), makeDSConfig(f2, []string{"13"}), cursor1)
+	if err != nil {
+		t.Fatalf("second sync must not fail on a single detail error, got %v", err)
+	}
+	f2.Close()
+
+	found := false
+	for _, it := range items2 {
+		if it.Metadata["error"] != "" && it.ExternalID == "2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an error placeholder for doc 2, got %+v", items2)
+	}
+
+	var cur2 yuqueCursor
+	if b, merr := json.Marshal(cursor2.ConnectorCursor); merr != nil {
+		t.Fatalf("encode cursor: %v", merr)
+	} else if uerr := json.Unmarshal(b, &cur2); uerr != nil {
+		t.Fatalf("decode cursor: %v", uerr)
+	}
+	if _, exists := cur2.BookDocTimes["13"]["2"]; exists {
+		t.Fatal("failed new doc must not be acknowledged into the cursor")
+	}
+	if got := cur2.BookDocTimes["13"]["1"]; got != "2026-04-20T10:00:00Z" {
+		t.Errorf("unchanged doc 1 cursor entry must be untouched, got %q", got)
+	}
+
+	// Third sync, endpoint recovered: doc 2 is ingested as a new item.
+	f3 := newFakeYuque()
+	defer f3.Close()
+	f3.handleJSON("/api/v2/repos/13/docs", 200, v2DocListResponse{Data: []v2Doc{
+		{ID: 1, Type: "Doc", Status: "1", Title: "A", Slug: "a", ContentUpdatedAt: "2026-04-20T10:00:00Z"},
+		{ID: 2, Type: "Doc", Status: "1", Title: "New", Slug: "new", ContentUpdatedAt: "2026-04-20T12:00:00Z"},
+	}})
+	f3.handleJSON("/api/v2/repos/docs/2", 200, v2DocDetailResponse{Data: v2DocDetail{
+		ID: 2, Title: "New", Body: "new content", Status: "1", ContentUpdatedAt: "2026-04-20T12:00:00Z",
+	}})
+
+	items3, _, err := NewConnector().FetchIncremental(context.Background(), makeDSConfig(f3, []string{"13"}), cursor2)
+	if err != nil {
+		t.Fatalf("third sync: %v", err)
+	}
+	if len(items3) != 1 || items3[0].ExternalID != "2" {
+		t.Fatalf("expected new doc 2 to be ingested after recovery, got %+v", items3)
 	}
 }

@@ -93,7 +93,8 @@ func sandboxDomainFor(cfg *Config) string {
 	}
 }
 
-// Dial opens a WebSocket to port/path of sandboxID.
+// Dial opens a WebSocket to port/path of sandboxID. path may carry a query
+// string ("/websockify?token=3"); it is split at the first "?".
 //
 // extraHeader carries credentials the caller owns — for the desktop that is
 // Authorization: Basic for websockify, and the handle's inbound traffic token
@@ -127,7 +128,14 @@ func (d *WebsocketDialer) Dial(
 	}
 
 	authority := fmt.Sprintf("%d-%s.%s", port, sandboxID, d.sandboxDomain)
-	target := &url.URL{Scheme: d.scheme, Host: authority, Path: path}
+	// Split off the query: url.URL.Path would escape a literal "?".
+	var rawQuery string
+	if i := strings.Index(path, "?"); i >= 0 {
+		path, rawQuery = path[:i], path[i+1:]
+	}
+	target := &url.URL{
+		Scheme: d.scheme, Host: authority, Path: path, RawQuery: rawQuery,
+	}
 
 	header := http.Header{}
 	for key, values := range extraHeader {
@@ -144,22 +152,20 @@ func (d *WebsocketDialer) Dial(
 		}
 	}
 
-	netDialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control:   SafeDialControlForPolicy(d.policy),
-	}
+	guardedDial := GuardedDialContext(d.policy)
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 		// Only "binary" — see the doc comment.
 		Subprotocols: []string{"binary"},
 		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Ignore addr and dial the gateway, exactly as
-			// newGatewayDataTransportWithPolicy does for HTTP.
+			// newGatewayDataTransportWithPolicy does for HTTP — both go
+			// through GuardedDialContext, so the two data planes judge the
+			// same name at the same point.
 			if d.target != "" {
 				addr = d.target
 			}
-			return netDialer.DialContext(ctx, network, addr)
+			return guardedDial(ctx, network, addr)
 		},
 	}
 	dialer.NetDialTLSContext = nil // let the TLS handshake use NetDialContext
