@@ -1,0 +1,23 @@
+=== RUN   TestListBySourceRef_SQLiteMatchesExactAndTitledRefs
+
+2026/11/18 09:24:28 [31;1m/home/runner/work/WeKnora/WeKnora/internal/application/repository/wiki_page.go:138 [35;1mno such table: knowledge_bases
+[0m[33m[0.492ms] [34;1m[rows:0][0m SELECT `id` FROM `knowledge_bases` WHERE (id = "kb-src" AND tenant_id = 1) AND `knowledge_bases`.`deleted_at` IS NULL LIMIT 1 
+    wiki_page_sqlite_source_ref_test.go:31: 
+        	Error Trace:	/home/runner/work/WeKnora/WeKnora/internal/application/repository/wiki_page_sqlite_source_ref_test.go:31
+        	Error:      	Received unexpected error:
+        	            	no such table: knowledge_bases
+        	Test:       	TestListBySourceRef_SQLiteMatchesExactAndTitledRefs
+--- FAIL: TestListBySourceRef_SQLiteMatchesExactAndTitledRefs (0.00s)
+=== RUN   TestListSummariesByKnowledgeIDs_SQLiteMatchesSourceRefs
+
+2026/11/18 09:24:28 [31;1m/home/runner/work/WeKnora/WeKnora/internal/application/repository/wiki_page.go:138 [35;1mno such table: knowledge_bases
+[0m[33m[0.194ms] [34;1m[rows:0][0m SELECT `id` FROM `knowledge_bases` WHERE (id = "kb-src" AND tenant_id = 1) AND `knowledge_bases`.`deleted_at` IS NULL LIMIT 1 
+    wiki_page_sqlite_source_ref_test.go:68: 
+        	Error Trace:	/home/runner/work/WeKnora/WeKnora/internal/application/repository/wiki_page_sqlite_source_ref_test.go:68
+        	Error:      	Received unexpected error:
+        	            	no such table: knowledge_bases
+        	Test:       	TestListSummariesByKnowledgeIDs_SQLiteMatchesSourceRefs
+--- FAIL: TestListSummariesByKnowledgeIDs_SQLiteMatchesSourceRefs (0.00s)
+FAIL
+FAIL	github.com/Tencent/WeKnora/internal/application/repository	0.449s
+FAIL
