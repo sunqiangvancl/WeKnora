@@ -24,6 +24,7 @@ env:
   UPSTREAM_SHA: 53ce747b5ca4c5b1b8e001a3d93769fd331eada8
   NATIVE_SHA: 9af34566ed9f2077d1ad9b80829c9713341798cc
   RELEASE_TAG: merge-arm64-20261120
+  NODE_OPTIONS: "--max-old-space-size=6144"
 
 jobs:
   merge-gate-package-release:
