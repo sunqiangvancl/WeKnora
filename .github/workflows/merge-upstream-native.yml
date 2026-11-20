@@ -165,8 +165,8 @@ jobs:
       - name: G4 - desktop build (same tags as packaging)
         run: go build -tags "$BUILD_TAGS" ./cmd/desktop
 
-      - name: G5 - nocgo arm64 cross-compile of server
-        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/server
+      - name: G5 - nocgo jieba fallback test (internal/types)
+        run: CGO_ENABLED=0 go test ./internal/types -run TestDefaultParserEngine -count=1
 
       - name: G6 - frontend build
         working-directory: frontend
