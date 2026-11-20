@@ -30,7 +30,7 @@ const (
 )
 
 func init() {
-	types.SetPreferParserEngine(preferAnydocWhenAvailable)
+	types.SetPreferParserEngine(preferNativeOrAnydoc)
 	RegisterEngine(&builtinEngine{})
 	RegisterEngine(&simpleEngine{})
 	RegisterEngine(&anydocEngine{})
@@ -52,6 +52,16 @@ func init() {
 // tables and layout are gone. The builtin parser classifies pages
 // individually and routes scanned ones through OCR/VLM, so it is the better
 // default for the one type anydoc cannot model.
+// preferNativeOrAnydoc lets the desktop build use its in-process parser for
+// PDF/Office/HTML, while non-desktop builds keep the documented anydoc/docreader
+// ordering. preferredNativeEngine is build-tagged and returns "" outside desktop.
+func preferNativeOrAnydoc(fileType string) string {
+	if engine := preferredNativeEngine(fileType); engine != "" {
+		return engine
+	}
+	return preferAnydocWhenAvailable(fileType)
+}
+
 func preferAnydocWhenAvailable(fileType string) string {
 	ft := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(fileType), "."))
 	if IsSimpleFormat(ft) || ft == "pdf" {

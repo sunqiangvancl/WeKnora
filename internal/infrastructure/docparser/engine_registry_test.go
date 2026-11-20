@@ -49,11 +49,22 @@ func TestListAllEnginesBuiltinIncludesDocumentFormats(t *testing.T) {
 }
 
 func TestDefaultParserEnginePrefersAnydocWhenLinked(t *testing.T) {
+	// The desktop build intentionally defaults some formats to the in-process
+	// native parser. Derive the expectation from the same build-tagged oracle
+	// the product uses, so this test holds for both desktop (native) and
+	// non-desktop (official) builds without hard-coding either outcome.
+	expected := func(ft, official string) string {
+		if n := preferredNativeEngine(ft); n != "" {
+			return n
+		}
+		return official
+	}
 	cases := []string{"pptx", "ppt", "docx"}
 	if anydoc.Available() {
 		for _, ft := range cases {
-			if got := types.DefaultParserEngine(ft); got != AnydocEngineName {
-				t.Errorf("DefaultParserEngine(%s) = %q, want anydoc when the binding is linked", ft, got)
+			want := expected(ft, AnydocEngineName)
+			if got := types.DefaultParserEngine(ft); got != want {
+				t.Errorf("DefaultParserEngine(%s) = %q, want %q when the binding is linked", ft, got, want)
 			}
 		}
 		if got := types.DefaultParserEngine("csv"); got != "" {
@@ -68,11 +79,11 @@ func TestDefaultParserEnginePrefersAnydocWhenLinked(t *testing.T) {
 		}
 		return
 	}
-	if got := types.DefaultParserEngine("pptx"); got != "markitdown" {
-		t.Fatalf("DefaultParserEngine(pptx) = %q, want markitdown when anydoc is unavailable", got)
+	if got, want := types.DefaultParserEngine("pptx"), expected("pptx", "markitdown"); got != want {
+		t.Fatalf("DefaultParserEngine(pptx) = %q, want %q when anydoc is unavailable", got, want)
 	}
-	if got := types.DefaultParserEngine("docx"); got != "" {
-		t.Fatalf("DefaultParserEngine(docx) = %q, want empty when anydoc is unavailable", got)
+	if got, want := types.DefaultParserEngine("docx"), expected("docx", ""); got != want {
+		t.Fatalf("DefaultParserEngine(docx) = %q, want %q when anydoc is unavailable", got, want)
 	}
 }
 
