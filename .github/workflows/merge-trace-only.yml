@@ -1,0 +1,151 @@
+name: Trace merge result to branch
+
+# Lightweight, build-free workflow whose ONLY purpose is to land the three-way
+# merge result (upstream 53ce747 + native 9af3456 + G1 contract fix) onto the
+# merge branch. The original all-in-one workflow failed its final trace push
+# because wails left a ~360MB `desktop` binary under cmd/desktop/build/ that
+# `git add -A` swept into the commit (GH001 100MB limit). This workflow starts
+# from a CLEAN checkout (no build artifacts) and stages files PRECISELY.
+# The final push uses GITHUB_TOKEN, which by design does NOT re-trigger this
+# workflow -> no self-loop.
+
+on:
+  push:
+    branches:
+      - merge/upstream-53ce747-native
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MERGE_BRANCH: merge/upstream-53ce747-native
+  UPSTREAM_SHA: 53ce747b5ca4c5b1b8e001a3d93769fd331eada8
+  NATIVE_SHA: 9af34566ed9f2077d1ad9b80829c9713341798cc
+
+jobs:
+  trace-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # 1) Clean checkout of the merge branch (trigger files + patches present,
+      #    NO packaging artifacts). Full history needed for the three-way merge.
+      - name: Checkout merge branch (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.MERGE_BRANCH }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # 2) Fetch upstream tip with an explicit refspec so official/53ce747
+      #    exists for the later checkout. Native commit fetch is best-effort.
+      - name: Fetch upstream 53ce747 + native 9af3456, verify objects
+        run: |
+          set -euo pipefail
+          git remote remove official 2>/dev/null || true
+          git remote add official https://github.com/Tencent/WeKnora.git
+          git fetch --no-tags official "${UPSTREAM_SHA}:refs/remotes/official/53ce747"
+          git cat-file -e "${UPSTREAM_SHA}^{commit}"
+          echo "::notice::upstream object verified: ${UPSTREAM_SHA}"
+          git fetch --no-tags origin "${NATIVE_SHA}:refs/remotes/origin/native-9af3456" || \
+            echo "::notice::native commit not directly fetchable; using embedded patch"
+          if git cat-file -e "${NATIVE_SHA}^{commit}" 2>/dev/null; then
+            echo "::notice::native object verified: ${NATIVE_SHA}"
+          fi
+
+      # 3) Three-way merge. evaluation.go conflict is EXPECTED; tolerate the
+      #    non-zero exit and assert no unexpected conflicts.
+      - name: Merge upstream --no-ff (expect evaluation.go conflict)
+        run: |
+          set -euo pipefail
+          git merge --no-ff "${UPSTREAM_SHA}" -m "merge(upstream): 53ce747 -> ${MERGE_BRANCH}" || \
+            echo "::notice::merge stopped with conflicts; resolving in next steps"
+          echo "--- unmerged paths ---"
+          git diff --name-only --diff-filter=U || true
+          for f in $(git diff --name-only --diff-filter=U); do
+            case "$f" in
+              internal/types/evaluation.go|.gitattributes) ;;
+              *) echo "::error::unexpected merge conflict: $f"; exit 1 ;;
+            esac
+          done
+          # .gitattributes auto-merges (distinct hunks); accept result.
+          git add .gitattributes 2>/dev/null || true
+
+      # 4) D1: adopt official evaluation.go, migrate fork jieba symbols.
+      - name: Resolve jieba conflict (official evaluation.go + migrate patch)
+        run: |
+          set -euo pipefail
+          git checkout "official/53ce747" -- internal/types/evaluation.go
+          git apply patches/jieba-cgo-migrate.patch
+          echo "--- jieba embed directive ---"
+          grep -n 'go:embed' internal/types/jieba_cgo.go
+          echo "--- Jieba declarations (expect exactly 2: cgo + nocgo) ---"
+          grep -h 'var Jieba' internal/types/jieba_cgo.go internal/types/jieba_nocgo.go
+          JCOUNT=$(grep -h 'var Jieba' internal/types/jieba_cgo.go internal/types/jieba_nocgo.go | wc -l | tr -d ' ')
+          test "${JCOUNT}" -eq 2
+          echo "::notice::jieba migration OK (Jieba declarations=${JCOUNT})"
+
+      # 5) D2 native patch, hunk-level.
+      - name: Apply native patch (check then apply)
+        run: |
+          set -euo pipefail
+          git apply --check patches/native-9af3456.patch
+          git apply patches/native-9af3456.patch
+          test ! -e .github/workflows/qoder-verify.yml
+          echo "RegisterEngine count: $(grep -c 'RegisterEngine(' internal/infrastructure/docparser/engines.go)"
+          echo "native_*.go count: $(ls internal/infrastructure/docparser/native_*.go | wc -l | tr -d ' ')"
+          echo "::notice::native patch applied (qoder-verify.yml absent)"
+
+      # 6) G1 test-contract fix.
+      - name: Apply G1 test-contract fix
+        run: |
+          set -euo pipefail
+          git apply --check patches/g1-test-contract-fix.patch
+          git apply patches/g1-test-contract-fix.patch
+          grep -q 'func preferredNativeEngine' internal/infrastructure/docparser/native_pref_desktop.go
+          grep -q 'expected := func(ft, official string) string' internal/infrastructure/docparser/engine_registry_test.go
+          echo "::notice::G1 test-contract fix applied"
+
+      # 7) PRECISE staging. NO `git add -A`: -u stages only tracked edits, then
+      #    explicitly add the new native files + pdf2md.swift. This is the
+      #    GH001 fix -- packaging binaries can never enter the commit.
+      - name: Stage merge result precisely (no build artifacts)
+        run: |
+          set -euo pipefail
+          # Tracked modifications (engines.go, evaluation.go, jieba_cgo.go,
+          # engine_registry_test.go, .gitattributes, existing files).
+          git add -u
+          # New files introduced by the patches (explicit, no globbing over build dirs).
+          git add internal/infrastructure/docparser/native_*.go
+          git add tools/pdf2md/pdf2md.swift
+          echo "--- staged files ---"
+          git diff --cached --name-only
+          # Guard: no packaging artifacts / large binaries in the index.
+          if git diff --cached --name-only | grep -Ei '(^|/)(desktop|build|dmg_staging|node_modules|\.dmg$|\.app$|\.sha256$|dist/|web/)'; then
+            echo "::error::refusing to commit build artifacts detected in the index"
+            exit 1
+          fi
+          # Guard: every staged blob must stay well under GitHub's 100MB limit.
+          MAXBYTES=$(git diff --cached --name-only -z | xargs -0 -r du -b | sort -rn | head -n1 | cut -f1)
+          echo "largest staged file bytes: ${MAXBYTES:-0}"
+          if [ -n "${MAXBYTES:-}" ] && [ "${MAXBYTES}" -gt 10485760 ]; then
+            echo "::error::staged file exceeds 10MB safety threshold (${MAXBYTES} bytes)"
+            exit 1
+          fi
+          echo "::notice::precise staging OK (no large artifacts)"
+
+      # 8) Commit (skip if nothing staged) and push with GITHUB_TOKEN.
+      - name: Commit and push merge result
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "::notice::nothing to commit; merge result already on branch"
+          else
+            git commit -m "merge(upstream+native): 53ce747 + 9af3456"
+          fi
+          git push origin "${MERGE_BRANCH}"
+          echo "::notice::trace push done; merge parents: $(git log -1 --pretty='%P')"
