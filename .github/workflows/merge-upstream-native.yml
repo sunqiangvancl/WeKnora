@@ -1,0 +1,282 @@
+name: Merge upstream 53ce747 + native 9af3456 (arm64 DMG)
+
+# V2 single-workflow / single-job topology.
+# The ONLY external trigger is the initial MCP push_files of this workflow and
+# the two patch files to the merge branch. Everything below (merge, conflict
+# resolution, gates, packaging, release, trace push) runs sequentially in one
+# job. The final push uses GITHUB_TOKEN, which by GitHub design does NOT
+# re-trigger this workflow -> no self-loop / deadlock.
+
+on:
+  push:
+    branches:
+      - merge/upstream-53ce747-native
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Single source of truth for build tags: desktop is the ONLY switch that
+  # makes preferredNativeEngine() return a native engine (R-05 hard gate).
+  BUILD_TAGS: "desktop,sqlite_fts5"
+  MERGE_BRANCH: merge/upstream-53ce747-native
+  UPSTREAM_SHA: 53ce747b5ca4c5b1b8e001a3d93769fd331eada8
+  NATIVE_SHA: 9af34566ed9f2077d1ad9b80829c9713341798cc
+  RELEASE_TAG: merge-arm64-20261120
+
+jobs:
+  merge-gate-package-release:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      # 1) Checkout the merge branch with full history (three-way merge needs
+      #    the common ancestor 23ed8816).
+      - name: Checkout merge branch (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.MERGE_BRANCH }}
+
+      # 2) Toolchains. setup-go/setup-node MUST precede the gates (G1-G6).
+      - name: Setup Go (from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Show toolchain + install Wails CLI
+        run: |
+          set -euo pipefail
+          go version
+          node --version
+          xcodebuild -version
+          go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # 3) Add official remote and fetch upstream tip. Fetch with an explicit
+      #    refspec so that the ref `official/53ce747` exists for the later
+      #    `git checkout official/53ce747 -- ...`. Network reachability is a
+      #    hard precondition: cat-file failure stops the job.
+      - name: Fetch upstream 53ce747 + native 9af3456, verify objects
+        run: |
+          set -euo pipefail
+          git remote remove official 2>/dev/null || true
+          git remote add official https://github.com/Tencent/WeKnora.git
+          git fetch --no-tags official "${UPSTREAM_SHA}:refs/remotes/official/53ce747"
+          git cat-file -e "${UPSTREAM_SHA}^{commit}"
+          echo "::notice::upstream object verified: ${UPSTREAM_SHA}"
+          # 9af3456 is a detached commit; fetching it is informational only
+          # (the native patch is embedded in patches/). Best effort.
+          git fetch --no-tags origin "${NATIVE_SHA}:refs/remotes/origin/native-9af3456" || \
+            echo "::notice::native commit not directly fetchable; using embedded patch"
+          if git cat-file -e "${NATIVE_SHA}^{commit}" 2>/dev/null; then
+            echo "::notice::native object verified: ${NATIVE_SHA}"
+          fi
+
+      # 4) Three-way merge. A conflict in evaluation.go is EXPECTED; tolerate
+      #    the non-zero merge exit, then assert no unexpected conflicts.
+      - name: Merge upstream --no-ff (expect evaluation.go conflict)
+        run: |
+          set -euo pipefail
+          git merge --no-ff "${UPSTREAM_SHA}" -m "merge(upstream): 53ce747 -> ${MERGE_BRANCH}" || \
+            echo "::notice::merge stopped with conflicts; resolving in next steps"
+          echo "--- unmerged paths ---"
+          git diff --name-only --diff-filter=U || true
+          for f in $(git diff --name-only --diff-filter=U); do
+            case "$f" in
+              internal/types/evaluation.go|.gitattributes) ;;
+              *) echo "::error::unexpected merge conflict: $f"; exit 1 ;;
+            esac
+          done
+          # .gitattributes auto-merges (distinct hunks); accept result.
+          git add .gitattributes 2>/dev/null || true
+
+      # 5) D1 conflict resolution: adopt official evaluation.go (no jieba block)
+      #    and migrate the fork's 10 jieba symbols into official jieba_cgo.go.
+      - name: Resolve jieba conflict (official evaluation.go + migrate patch)
+        run: |
+          set -euo pipefail
+          git checkout "official/53ce747" -- internal/types/evaluation.go
+          git apply patches/jieba-cgo-migrate.patch
+          echo "--- jieba embed directive ---"
+          grep -n 'go:embed' internal/types/jieba_cgo.go
+          echo "--- Jieba declarations (expect exactly 2: cgo + nocgo) ---"
+          grep -h 'var Jieba' internal/types/jieba_cgo.go internal/types/jieba_nocgo.go
+          JCOUNT=$(grep -h 'var Jieba' internal/types/jieba_cgo.go internal/types/jieba_nocgo.go | wc -l | tr -d ' ')
+          test "${JCOUNT}" -eq 2
+          echo "::notice::jieba migration OK (Jieba declarations=${JCOUNT})"
+
+      # 6) D2 native patch, hunk-level: engines.go prefer-only + 10 new files.
+      #    --check first (context-drift protection); qoder-verify.yml excluded.
+      - name: Apply native patch (check then apply)
+        run: |
+          set -euo pipefail
+          git apply --check patches/native-9af3456.patch
+          git apply patches/native-9af3456.patch
+          test ! -e .github/workflows/qoder-verify.yml
+          echo "RegisterEngine count: $(grep -c 'RegisterEngine(' internal/infrastructure/docparser/engines.go)"
+          echo "native_*.go count: $(ls internal/infrastructure/docparser/native_*.go | wc -l | tr -d ' ')"
+          echo "::notice::native patch applied (qoder-verify.yml absent)"
+
+      # 7) Gates G1-G6. unified BUILD_TAGS throughout; any non-zero stops.
+      - name: G1 - native unit tests
+        run: go test -tags "$BUILD_TAGS" -count=1 ./internal/infrastructure/docparser
+
+      - name: G2 - PDF helper runtime assertion (swiftc compile + executable)
+        run: |
+          set -euo pipefail
+          test -f tools/pdf2md/pdf2md.swift
+          swiftc -O tools/pdf2md/pdf2md.swift -o /tmp/pdf2md-gate
+          test -x /tmp/pdf2md-gate
+          # nativePDFHelperPath() is build-tagged/darwin; assert the helper is
+          # runnable and that the routing symbol exists in the source tree.
+          grep -q 'func nativePDFHelperPath' internal/infrastructure/docparser/native_pdf_darwin.go
+          grep -q 'return NativeEngineName' internal/infrastructure/docparser/native_pref_desktop.go
+          echo "::notice::PDF helper compiles and is executable"
+
+      - name: G3 - go vet
+        run: go vet -tags "$BUILD_TAGS" ./internal/types ./internal/infrastructure/docparser
+
+      - name: G4 - desktop build (same tags as packaging)
+        run: go build -tags "$BUILD_TAGS" ./cmd/desktop
+
+      - name: G5 - nocgo arm64 cross-compile of server
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/server
+
+      - name: G6 - frontend build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      # 8) Package. native routing is active because wails uses BUILD_TAGS
+      #    (desktop,sqlite_fts5) - the same tags the gates used.
+      - name: Stage web assets for Resources
+        run: |
+          set -euo pipefail
+          rm -rf web
+          cp -R frontend/dist web
+          test -f web/index.html
+
+      - name: Build desktop app (arm64, BUILD_TAGS)
+        run: |
+          set -euo pipefail
+          bash ./scripts/check-license-bundle.sh
+          eval "$(./scripts/get_version.sh env)"
+          LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+          export CGO_CFLAGS="-Wno-deprecated-declarations"
+          export CGO_LDFLAGS="-Wl,-no_warn_duplicate_libraries"
+          cd cmd/desktop
+          wails build -clean -tags "$BUILD_TAGS" -platform darwin/arm64 \
+            -ldflags="$LDFLAGS" -o "WeKnora Lite"
+
+      - name: Build pdf2md universal + bundle into Resources + codesign
+        run: |
+          set -euo pipefail
+          swiftc -O -target arm64-apple-macosx12.0 tools/pdf2md/pdf2md.swift -o /tmp/pdf2md-arm64
+          swiftc -O -target x86_64-apple-macosx12.0 tools/pdf2md/pdf2md.swift -o /tmp/pdf2md-amd64
+          lipo -create /tmp/pdf2md-arm64 /tmp/pdf2md-amd64 -output /tmp/pdf2md-universal
+          APP="cmd/desktop/build/bin/WeKnora Lite.app"
+          RES="${APP}/Contents/Resources"
+          test -d "${APP}"
+          mkdir -p "${RES}/config" "${RES}/migrations/sqlite" "${RES}/web"
+          if [ -f scripts/copy-licenses.sh ]; then bash ./scripts/copy-licenses.sh "${RES}"; fi
+          if [ -f .env.lite.example ]; then cp .env.lite.example "${RES}/.env"; fi
+          cp -r migrations/sqlite/* "${RES}/migrations/sqlite/"
+          cp -r config/* "${RES}/config/"
+          cp -R web/. "${RES}/web/"
+          test -f "${RES}/web/index.html"
+          cp /tmp/pdf2md-universal "${RES}/pdf2md"
+          chmod +x "${RES}/pdf2md"
+          codesign --force --sign - "${RES}/pdf2md"
+          codesign --force --deep --sign - "${APP}" || true
+          lipo -info "${RES}/pdf2md"
+
+      - name: Package DMG + shasum
+        run: |
+          set -euo pipefail
+          APP="cmd/desktop/build/bin/WeKnora Lite.app"
+          DMG_NAME="WeKnora-Lite-App_macOS_arm64.dmg"
+          STAGE="dmg_staging"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}"
+          cp -R "${APP}" "${STAGE}/"
+          ln -s /Applications "${STAGE}/Applications"
+          hdiutil create -volname "WeKnora Lite" -srcfolder "${STAGE}" \
+            -ov -format UDZO "${DMG_NAME}"
+          shasum -a 256 "${DMG_NAME}" > "${DMG_NAME}.sha256"
+          cat "${DMG_NAME}.sha256"
+
+      # 9) Artifact self-check: native routing logic present + helper runnable.
+      - name: Artifact self-check
+        run: |
+          set -euo pipefail
+          grep -q 'preferNativeOrAnydoc' internal/infrastructure/docparser/engines.go
+          grep -q 'return NativeEngineName' internal/infrastructure/docparser/native_pref_desktop.go
+          APP="cmd/desktop/build/bin/WeKnora Lite.app"
+          RES="${APP}/Contents/Resources"
+          test -x "${RES}/pdf2md"
+          test -f "${RES}/web/index.html"
+          if strings "${APP}/Contents/MacOS/WeKnora Lite" | grep -q 'preferredNativeEngine'; then
+            echo "::notice::native routing symbol present in built binary"
+          else
+            echo "::warning::native symbol not found via strings (may be stripped); source checks passed"
+          fi
+          echo "::notice::artifact self-check OK"
+
+      # 10) Release with a FIXED tag + explicit --target on the merge branch;
+      #     guarded to this branch only. GITHUB_TOKEN events do not re-trigger.
+      - name: Publish prerelease (fixed tag, explicit target)
+        if: github.ref == format('refs/heads/{0}', env.MERGE_BRANCH)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DMG_NAME="WeKnora-Lite-App_macOS_arm64.dmg"
+          gh release create "${RELEASE_TAG}" \
+            "${DMG_NAME}" "${DMG_NAME}.sha256" \
+            --target "${MERGE_BRANCH}" \
+            --title "WeKnora Lite macOS arm64 (upstream 53ce747 + native 9af3456)" \
+            --notes "Three-way merge build. Upstream 53ce747 + native parser 9af3456; jieba re-embedded in cgo file; gates G1-G6 passed. macOS arm64, ad-hoc signed, not notarized." \
+            --prerelease
+          echo "::notice::release ${RELEASE_TAG} created"
+
+      # 11) FINAL step: trace commit + push. Keep build artifacts out of the
+      #     commit via .git/info/exclude, then complete the merge commit and
+      #     push (GITHUB_TOKEN push does NOT trigger a new run).
+      - name: Trace - commit merge result and push merge branch
+        run: |
+          set -euo pipefail
+          cat >> .git/info/exclude <<'EOF'
+          *.dmg
+          *.sha256
+          dmg_staging/
+          frontend/dist/
+          /dist/
+          /build/
+          web/
+          cmd/desktop/build/
+          node_modules/
+          EOF
+          rm -rf dmg_staging
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::notice::nothing to commit in trace step"
+          else
+            git commit -m "merge(upstream+native): 53ce747 + 9af3456"
+          fi
+          git push origin "${MERGE_BRANCH}"
+          echo "::notice::trace push done; merge parents: $(git log -1 --pretty='%P')"
