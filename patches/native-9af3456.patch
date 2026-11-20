@@ -1,0 +1,1044 @@
+diff --git a/internal/infrastructure/docparser/engines.go b/internal/infrastructure/docparser/engines.go
+--- a/internal/infrastructure/docparser/engines.go
++++ b/internal/infrastructure/docparser/engines.go
+@@ -30,7 +30,7 @@
+ )
+ 
+ func init() {
+-	types.SetPreferParserEngine(preferAnydocWhenAvailable)
++	types.SetPreferParserEngine(preferNativeOrAnydoc)
+ 	RegisterEngine(&builtinEngine{})
+ 	RegisterEngine(&simpleEngine{})
+ 	RegisterEngine(&anydocEngine{})
+@@ -52,6 +52,16 @@
+ // tables and layout are gone. The builtin parser classifies pages
+ // individually and routes scanned ones through OCR/VLM, so it is the better
+ // default for the one type anydoc cannot model.
++// preferNativeOrAnydoc lets the desktop build use its in-process parser for
++// PDF/Office/HTML, while non-desktop builds keep the documented anydoc/docreader
++// ordering. preferredNativeEngine is build-tagged and returns "" outside desktop.
++func preferNativeOrAnydoc(fileType string) string {
++	if engine := preferredNativeEngine(fileType); engine != "" {
++		return engine
++	}
++	return preferAnydocWhenAvailable(fileType)
++}
++
+ func preferAnydocWhenAvailable(fileType string) string {
+ 	ft := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(fileType), "."))
+ 	if IsSimpleFormat(ft) || ft == "pdf" {
+diff --git a/internal/infrastructure/docparser/native_engine.go b/internal/infrastructure/docparser/native_engine.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_engine.go
+@@ -0,0 +1,34 @@
++package docparser
++
++import (
++	"context"
++
++	"github.com/Tencent/WeKnora/internal/types/interfaces"
++)
++
++// NativeEngineName is the in-process parser used by the Lite desktop app.
++const NativeEngineName = "native"
++
++func init() {
++	RegisterEngine(&nativeEngine{})
++}
++
++type nativeEngine struct{}
++
++func (e *nativeEngine) Name() string { return NativeEngineName }
++
++func (e *nativeEngine) Description() string {
++	return "Built-in local parser (PDF/Office/HTML, no external service)"
++}
++
++func (e *nativeEngine) FileTypes(_ bool) []string {
++	return []string{"pdf", "doc", "docx", "xlsx", "pptx", "html", "htm", "url"}
++}
++
++func (e *nativeEngine) CheckAvailable(_ bool, _ map[string]string) (bool, string) {
++	return true, ""
++}
++
++func (e *nativeEngine) NewReader(_ context.Context, _ ReaderDeps) (interfaces.DocReader, error) {
++	return &NativeReader{}, nil
++}
+diff --git a/internal/infrastructure/docparser/native_html.go b/internal/infrastructure/docparser/native_html.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_html.go
+@@ -0,0 +1,57 @@
++package docparser
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++
++	htmltomd "github.com/JohannesKaufmann/html-to-markdown/v2"
++	"github.com/Tencent/WeKnora/internal/utils"
++)
++
++const nativeHTMLMaxBytes = 20 << 20
++
++func nativeHTMLToMarkdown(data []byte) (string, error) {
++	if len(data) == 0 {
++		return "", fmt.Errorf("native HTML parser: empty file")
++	}
++	md, err := htmltomd.ConvertString(string(data))
++	if err != nil {
++		return "", fmt.Errorf("native HTML parser: %w", err)
++	}
++	return strings.TrimSpace(md), nil
++}
++
++func nativeURLToMarkdown(ctx context.Context, rawURL string) (string, error) {
++	if err := utils.ValidateURLForSSRF(rawURL); err != nil {
++		return "", fmt.Errorf("native URL parser: %w", err)
++	}
++	client := utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{
++		Timeout:       30 * time.Second,
++		MaxRedirects: 5,
++	})
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
++	if err != nil {
++		return "", fmt.Errorf("native URL parser: %w", err)
++	}
++	req.Header.Set("User-Agent", "WeKnora-Lite/1.0")
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("native URL parser: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return "", fmt.Errorf("native URL parser: HTTP %d", resp.StatusCode)
++	}
++	body, err := io.ReadAll(io.LimitReader(resp.Body, nativeHTMLMaxBytes+1))
++	if err != nil {
++		return "", fmt.Errorf("native URL parser: read body: %w", err)
++	}
++	if len(body) > nativeHTMLMaxBytes {
++		return "", fmt.Errorf("native URL parser: response exceeds %d bytes", nativeHTMLMaxBytes)
++	}
++	return nativeHTMLToMarkdown(body)
++}
+diff --git a/internal/infrastructure/docparser/native_office.go b/internal/infrastructure/docparser/native_office.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_office.go
+@@ -0,0 +1,497 @@
++package docparser
++
++import (
++	"archive/zip"
++	"bytes"
++	"context"
++	"encoding/xml"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"runtime"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// nativeDOCXToMarkdown extracts paragraphs and simple tables from a DOCX.
++// It deliberately ignores styling, images and headers; the desktop native
++// path is a local fallback, not a replacement for a layout-aware parser.
++func nativeDOCXToMarkdown(data []byte) (string, error) {
++	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
++	if err != nil {
++		return "", fmt.Errorf("native DOCX parser: %w", err)
++	}
++	var doc io.ReadCloser
++	for _, f := range zr.File {
++		if f.Name == "word/document.xml" {
++			doc, err = f.Open()
++			if err != nil {
++				return "", fmt.Errorf("native DOCX parser: open document.xml: %w", err)
++			}
++			break
++		}
++	}
++	if doc == nil {
++		return "", fmt.Errorf("native DOCX parser: word/document.xml not found")
++	}
++	defer doc.Close()
++
++	dec := xml.NewDecoder(doc)
++	var out strings.Builder
++	var para, cell strings.Builder
++	var rows [][]string
++	var row []string
++	inTable, inCell := false, false
++
++	flushParagraph := func() {
++		text := strings.TrimSpace(para.String())
++		if text != "" {
++			out.WriteString(text)
++			out.WriteString("\n\n")
++		}
++		para.Reset()
++	}
++
++	for {
++		tok, err := dec.Token()
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			return "", fmt.Errorf("native DOCX parser: %w", err)
++		}
++		switch t := tok.(type) {
++		case xml.StartElement:
++			switch t.Name.Local {
++			case "tbl":
++				inTable = true
++				rows = nil
++			case "tr":
++				if inTable {
++					row = nil
++				}
++			case "tc":
++				if inTable {
++					inCell = true
++					cell.Reset()
++				}
++			case "p":
++				if !inCell {
++					para.Reset()
++				}
++			case "tab":
++				if inCell {
++					cell.WriteString("\t")
++				} else {
++					para.WriteString("\t")
++				}
++			case "br":
++				if inCell {
++					cell.WriteString("\n")
++				} else {
++					para.WriteString("\n")
++				}
++			}
++		case xml.CharData:
++			if inCell {
++				cell.Write(t)
++			} else {
++				para.Write(t)
++			}
++		case xml.EndElement:
++			switch t.Name.Local {
++			case "p":
++				if inTable {
++					if inCell {
++						cell.WriteString(" ")
++					}
++				} else {
++					flushParagraph()
++				}
++			case "tc":
++				if inTable {
++					row = append(row, strings.TrimSpace(cell.String()))
++					inCell = false
++				}
++			case "tr":
++				if inTable && len(row) > 0 {
++					rows = append(rows, row)
++				}
++			case "tbl":
++				if inTable {
++					out.WriteString(nativeRenderTable(rows))
++					inTable = false
++					rows = nil
++				}
++			}
++		}
++	}
++	flushParagraph()
++	return strings.TrimSpace(out.String()), nil
++}
++
++func nativeXLSXToMarkdown(data []byte) (string, error) {
++	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
++	if err != nil {
++		return "", fmt.Errorf("native XLSX parser: %w", err)
++	}
++	shared := nativeXLSXSharedStrings(zr)
++	files := make([]string, 0)
++	for _, f := range zr.File {
++		if strings.HasPrefix(f.Name, "xl/worksheets/sheet") && strings.HasSuffix(f.Name, ".xml") {
++			files = append(files, f.Name)
++		}
++	}
++	if len(files) == 0 {
++		return "", fmt.Errorf("native XLSX parser: no worksheets found")
++	}
++	sort.Strings(files)
++
++	var out strings.Builder
++	for i, name := range files {
++		md, err := nativeXLSXSheet(zr, name, shared)
++		if err != nil {
++			return "", err
++		}
++		if strings.TrimSpace(md) == "" {
++			continue
++		}
++		fmt.Fprintf(&out, "## Sheet %d\n\n%s\n\n", i+1, md)
++	}
++	return strings.TrimSpace(out.String()), nil
++}
++
++func nativeXLSXSharedStrings(zr *zip.Reader) []string {
++	var shared []string
++	for _, f := range zr.File {
++		if f.Name != "xl/sharedStrings.xml" {
++			continue
++		}
++		rc, err := f.Open()
++		if err != nil {
++			return nil
++		}
++		dec := xml.NewDecoder(rc)
++		var text strings.Builder
++		inSI, inT := false, false
++		for {
++			tok, err := dec.Token()
++			if err != nil {
++				break
++			}
++			switch t := tok.(type) {
++			case xml.StartElement:
++				switch t.Name.Local {
++				case "si":
++					inSI = true
++					text.Reset()
++				case "t":
++					inT = true
++				}
++			case xml.CharData:
++				if inSI && inT {
++					text.Write(t)
++				}
++			case xml.EndElement:
++				switch t.Name.Local {
++				case "t":
++					inT = false
++				case "si":
++					shared = append(shared, text.String())
++					inSI = false
++				}
++			}
++		}
++		rc.Close()
++		break
++	}
++	return shared
++}
++
++func nativeXLSXSheet(zr *zip.Reader, name string, shared []string) (string, error) {
++	var rc io.ReadCloser
++	for _, f := range zr.File {
++		if f.Name == name {
++			var err error
++			rc, err = f.Open()
++			if err != nil {
++				return "", fmt.Errorf("native XLSX parser: open %s: %w", name, err)
++			}
++			break
++		}
++	}
++	if rc == nil {
++		return "", fmt.Errorf("native XLSX parser: %s not found", name)
++	}
++	defer rc.Close()
++
++	rows := map[int]map[int]string{}
++	maxRow, maxCol := 0, 0
++	curRow, curCol := 0, 0
++	var ref, cellType string
++	var value strings.Builder
++	inValue, inInline := false, false
++
++	for {
++		dec := xml.NewDecoder(rc)
++		for {
++			tok, err := dec.Token()
++			if err == io.EOF {
++				break
++			}
++			if err != nil {
++				return "", fmt.Errorf("native XLSX parser: %s: %w", name, err)
++			}
++			switch t := tok.(type) {
++			case xml.StartElement:
++				switch t.Name.Local {
++				case "row":
++					if v := nativeXMLAttr(t, "r"); v != "" {
++						if n, err := strconv.Atoi(v); err == nil {
++							curRow = n
++						}
++					}
++					curCol = 0
++				case "c":
++					ref = nativeXMLAttr(t, "r")
++					cellType = nativeXMLAttr(t, "t")
++					value.Reset()
++				case "v":
++					inValue = true
++				case "is":
++					inInline = true
++				}
++			case xml.CharData:
++				if inValue || inInline {
++					value.Write(t)
++				}
++			case xml.EndElement:
++				switch t.Name.Local {
++				case "v":
++					inValue = false
++				case "is":
++					inInline = false
++				case "c":
++					r, c := nativeCellPosition(ref, curRow, curCol+1)
++					curRow, curCol = r, c
++					s := value.String()
++					if cellType == "s" {
++						if idx, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && idx >= 0 && idx < len(shared) {
++							s = shared[idx]
++						}
++					}
++					if strings.TrimSpace(s) != "" {
++						if rows[r] == nil {
++							rows[r] = map[int]string{}
++						}
++						rows[r][c] = s
++					}
++					if r > maxRow {
++						maxRow = r
++					}
++					if c > maxCol {
++						maxCol = c
++					}
++				}
++			}
++		}
++		break
++	}
++	if maxRow == 0 || maxCol == 0 {
++		return "", nil
++	}
++	if maxRow > 5000 || maxCol > 200 {
++		return "", fmt.Errorf("native XLSX parser: sheet too large (%d rows x %d columns)", maxRow, maxCol)
++	}
++
++	table := make([][]string, 0, maxRow)
++	for r := 1; r <= maxRow; r++ {
++		line := make([]string, maxCol)
++		for c := 1; c <= maxCol; c++ {
++			line[c-1] = rows[r][c]
++		}
++		table = append(table, line)
++	}
++	return nativeRenderTable(table), nil
++}
++
++func nativeXMLAttr(e xml.StartElement, name string) string {
++	for _, a := range e.Attr {
++		if a.Name.Local == name {
++			return a.Value
++		}
++	}
++	return ""
++}
++
++func nativeCellPosition(ref string, fallbackRow, fallbackCol int) (int, int) {
++	ref = strings.TrimSpace(ref)
++	if ref == "" {
++		return fallbackRow, fallbackCol
++	}
++	i := 0
++	col := 0
++	for i < len(ref) {
++		ch := ref[i]
++		if ch >= 'A' && ch <= 'Z' {
++			col = col*26 + int(ch-'A'+1)
++			i++
++			continue
++		}
++		if ch >= 'a' && ch <= 'z' {
++			col = col*26 + int(ch-'a'+1)
++			i++
++			continue
++		}
++		break
++	}
++	row, err := strconv.Atoi(ref[i:])
++	if err != nil || row <= 0 || col <= 0 {
++		return fallbackRow, fallbackCol
++	}
++	return row, col
++}
++
++func nativePPTXToMarkdown(data []byte) (string, error) {
++	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
++	if err != nil {
++		return "", fmt.Errorf("native PPTX parser: %w", err)
++	}
++	type slideFile struct {
++		name string
++		num  int
++	}
++	var slides []slideFile
++	for _, f := range zr.File {
++		if !strings.HasPrefix(f.Name, "ppt/slides/slide") || !strings.HasSuffix(f.Name, ".xml") {
++			continue
++		}
++		numText := strings.TrimSuffix(strings.TrimPrefix(f.Name, "ppt/slides/slide"), ".xml")
++		n, err := strconv.Atoi(numText)
++		if err != nil {
++			continue
++		}
++		slides = append(slides, slideFile{name: f.Name, num: n})
++	}
++	if len(slides) == 0 {
++		return "", fmt.Errorf("native PPTX parser: no slides found")
++	}
++	sort.Slice(slides, func(i, j int) bool { return slides[i].num < slides[j].num })
++
++	var out strings.Builder
++	for _, slide := range slides {
++		rc, err := func() (io.ReadCloser, error) {
++			for _, f := range zr.File {
++				if f.Name == slide.name {
++					return f.Open()
++				}
++			}
++			return nil, fmt.Errorf("slide %s not found", slide.name)
++		}()
++		if err != nil {
++			return "", fmt.Errorf("native PPTX parser: %w", err)
++		}
++		dec := xml.NewDecoder(rc)
++		var text strings.Builder
++		inText := false
++		for {
++			tok, err := dec.Token()
++			if err == io.EOF {
++				break
++			}
++			if err != nil {
++				rc.Close()
++				return "", fmt.Errorf("native PPTX parser: %s: %w", slide.name, err)
++			}
++			switch t := tok.(type) {
++			case xml.StartElement:
++				if t.Name.Local == "t" {
++					inText = true
++				}
++			case xml.CharData:
++				if inText {
++					text.Write(t)
++				}
++			case xml.EndElement:
++				switch t.Name.Local {
++				case "t":
++					inText = false
++					text.WriteString("\n")
++				case "p":
++					text.WriteString("\n")
++				}
++			}
++		}
++		rc.Close()
++		body := strings.TrimSpace(text.String())
++		if body == "" {
++			continue
++		}
++		fmt.Fprintf(&out, "## Slide %d\n\n%s\n\n", slide.num, body)
++	}
++	return strings.TrimSpace(out.String()), nil
++}
++
++func nativeDOCToMarkdown(ctx context.Context, data []byte) (string, error) {
++	if runtime.GOOS != "darwin" {
++		return "", fmt.Errorf("native DOC parser: only available on macOS")
++	}
++	f, err := os.CreateTemp("", "weknora-native-*.doc")
++	if err != nil {
++		return "", fmt.Errorf("native DOC parser: %w", err)
++	}
++	name := f.Name()
++	defer os.Remove(name)
++	if _, err := f.Write(data); err != nil {
++		f.Close()
++		return "", fmt.Errorf("native DOC parser: write temp file: %w", err)
++	}
++	if err := f.Close(); err != nil {
++		return "", fmt.Errorf("native DOC parser: close temp file: %w", err)
++	}
++	cmd := exec.CommandContext(ctx, "textutil", "-convert", "txt", "-stdout", "-encoding", "UTF-8", name)
++	out, err := cmd.Output()
++	if err != nil {
++		return "", fmt.Errorf("native DOC parser: textutil: %w", err)
++	}
++	return strings.TrimSpace(string(out)), nil
++}
++
++func nativeRenderTable(rows [][]string) string {
++	if len(rows) == 0 {
++		return ""
++	}
++	cols := 0
++	for _, row := range rows {
++		if len(row) > cols {
++			cols = len(row)
++		}
++	}
++	if cols == 0 {
++		return ""
++	}
++	var b strings.Builder
++	for i, row := range rows {
++		b.WriteString("|")
++		for c := 0; c < cols; c++ {
++			cell := ""
++			if c < len(row) {
++				cell = row[c]
++			}
++			b.WriteString(" ")
++			b.WriteString(strings.ReplaceAll(strings.ReplaceAll(cell, "|", `\|`), "\n", "<br>"))
++			b.WriteString(" |")
++		}
++		b.WriteString("\n")
++		if i == 0 {
++			b.WriteString("|")
++			for c := 0; c < cols; c++ {
++				b.WriteString(" --- |")
++			}
++			b.WriteString("\n")
++		}
++	}
++	return b.String()
++}
+diff --git a/internal/infrastructure/docparser/native_parser_test.go b/internal/infrastructure/docparser/native_parser_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_parser_test.go
+@@ -0,0 +1,86 @@
++package docparser
++
++import (
++	"archive/zip"
++	"bytes"
++	"context"
++	"testing"
++
++	"github.com/Tencent/WeKnora/internal/types"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func nativeTestZip(t *testing.T, files map[string]string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	zw := zip.NewWriter(&buf)
++	for name, body := range files {
++		w, err := zw.Create(name)
++		require.NoError(t, err)
++		_, err = w.Write([]byte(body))
++		require.NoError(t, err)
++	}
++	require.NoError(t, zw.Close())
++	return buf.Bytes()
++}
++
++func TestNativeDOCXExtractsParagraphsAndTable(t *testing.T) {
++	data := nativeTestZip(t, map[string]string{
++		"word/document.xml": `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
++<w:body>
++<w:p><w:r><w:t>Hello WeKnora</w:t></w:r></w:p>
++<w:tbl>
++<w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
++<w:tr><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc></w:tr>
++</w:tbl>
++</w:body></w:document>`,
++	})
++	md, err := nativeDOCXToMarkdown(data)
++	require.NoError(t, err)
++	assert.Contains(t, md, "Hello WeKnora")
++	assert.Contains(t, md, "| A | B |")
++	assert.Contains(t, md, "| 1 | 2 |")
++}
++
++func TestNativeXLSXExtractsSharedStrings(t *testing.T) {
++	data := nativeTestZip(t, map[string]string{
++		"xl/sharedStrings.xml": `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Name</t></si><si><t>Value</t></si><si><t>Alpha</t></si><si><t>42</t></si></sst>`,
++		"xl/worksheets/sheet1.xml": `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
++<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
++<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" t="s"><v>3</v></c></row>
++</sheetData></worksheet>`,
++	})
++	md, err := nativeXLSXToMarkdown(data)
++	require.NoError(t, err)
++	assert.Contains(t, md, "| Name | Value |")
++	assert.Contains(t, md, "| Alpha | 42 |")
++}
++
++func TestNativePPTXExtractsSlideText(t *testing.T) {
++	data := nativeTestZip(t, map[string]string{
++		"ppt/slides/slide1.xml": `<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`,
++	})
++	md, err := nativePPTXToMarkdown(data)
++	require.NoError(t, err)
++	assert.Contains(t, md, "## Slide 1")
++	assert.Contains(t, md, "Slide title")
++}
++
++func TestNativeHTMLConvertsToMarkdown(t *testing.T) {
++	md, err := nativeHTMLToMarkdown([]byte(`<h1>Title</h1><p>Hello <strong>world</strong></p>`))
++	require.NoError(t, err)
++	assert.Contains(t, md, "# Title")
++	assert.Contains(t, md, "Hello **world**")
++}
++
++func TestNativeReaderDispatchesHTML(t *testing.T) {
++	reader := &NativeReader{}
++	result, err := reader.Read(context.Background(), &types.ReadRequest{
++		FileName: "page.html",
++		FileType: "html",
++		FileContent: []byte(`<h1>Local</h1><p>body</p>`),
++	})
++	require.NoError(t, err)
++	assert.Contains(t, result.MarkdownContent, "# Local")
++}
+diff --git a/internal/infrastructure/docparser/native_pdf_darwin.go b/internal/infrastructure/docparser/native_pdf_darwin.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_pdf_darwin.go
+@@ -0,0 +1,81 @@
++//go:build darwin
++
++package docparser
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++
++	"github.com/Tencent/WeKnora/internal/types"
++)
++
++// nativePDFHelperPath locates the bundled pdf2md executable. Packaged apps
++// keep it in Contents/Resources; dev runs can set WEKNORA_PDF2MD.
++func nativePDFHelperPath() string {
++	if p := strings.TrimSpace(os.Getenv("WEKNORA_PDF2MD")); p != "" {
++		if nativeExecutableFile(p) {
++			return p
++		}
++	}
++	exe, err := os.Executable()
++	if err == nil {
++		const marker = ".app/Contents/MacOS"
++		if i := strings.Index(exe, marker); i >= 0 {
++			p := filepath.Join(exe[:i+len(".app/Contents")], "Resources", "pdf2md")
++			if nativeExecutableFile(p) {
++				return p
++			}
++		}
++	}
++	if p, err := exec.LookPath("pdf2md"); err == nil {
++		return p
++	}
++	return ""
++}
++
++func nativeExecutableFile(path string) bool {
++	info, err := os.Stat(path)
++	return err == nil && !info.IsDir() && info.Mode()&0111 != 0
++}
++
++func nativePDFToMarkdown(ctx context.Context, req *types.ReadRequest) (string, error) {
++	helper := nativePDFHelperPath()
++	if helper == "" {
++		return "", fmt.Errorf("native PDF helper not found; rebuild the desktop app or set WEKNORA_PDF2MD")
++	}
++	if len(req.FileContent) == 0 {
++		return "", fmt.Errorf("native PDF parser: empty file")
++	}
++
++	f, err := os.CreateTemp("", "weknora-native-*.pdf")
++	if err != nil {
++		return "", fmt.Errorf("native PDF parser: create temp file: %w", err)
++	}
++	name := f.Name()
++	defer os.Remove(name)
++	if _, err := f.Write(req.FileContent); err != nil {
++		f.Close()
++		return "", fmt.Errorf("native PDF parser: write temp file: %w", err)
++	}
++	if err := f.Close(); err != nil {
++		return "", fmt.Errorf("native PDF parser: close temp file: %w", err)
++	}
++
++	cmd := exec.CommandContext(ctx, helper, name)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	if err := cmd.Run(); err != nil {
++		msg := strings.TrimSpace(stderr.String())
++		if msg == "" {
++			msg = err.Error()
++		}
++		return "", fmt.Errorf("native PDF parser: %s", msg)
++	}
++	return stdout.String(), nil
++}
+diff --git a/internal/infrastructure/docparser/native_pdf_stub.go b/internal/infrastructure/docparser/native_pdf_stub.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_pdf_stub.go
+@@ -0,0 +1,16 @@
++//go:build !darwin
++
++package docparser
++
++import (
++	"context"
++	"fmt"
++
++	"github.com/Tencent/WeKnora/internal/types"
++)
++
++func nativePDFHelperPath() string { return "" }
++
++func nativePDFToMarkdown(_ context.Context, _ *types.ReadRequest) (string, error) {
++	return "", fmt.Errorf("native PDF parsing is only available on macOS")
++}
+diff --git a/internal/infrastructure/docparser/native_pref_default.go b/internal/infrastructure/docparser/native_pref_default.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_pref_default.go
+@@ -0,0 +1,7 @@
++//go:build !desktop
++
++package docparser
++
++// preferredNativeEngine is disabled outside the desktop build so the server
++// and Lite CLI keep using the documented docreader/default routing.
++func preferredNativeEngine(_ string) string { return "" }
+diff --git a/internal/infrastructure/docparser/native_pref_desktop.go b/internal/infrastructure/docparser/native_pref_desktop.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_pref_desktop.go
+@@ -0,0 +1,24 @@
++//go:build desktop
++
++package docparser
++
++import "runtime"
++
++// preferredNativeEngine routes the desktop app's default parser to the local
++// engine. It is intentionally gated by the "desktop" build tag: the Lite CLI
++// and full server keep their existing docreader/default behavior.
++func preferredNativeEngine(fileType string) string {
++	switch normalizeNativeType(fileType) {
++	case "pdf":
++		if nativePDFHelperPath() != "" {
++			return NativeEngineName
++		}
++	case "doc":
++		if runtime.GOOS == "darwin" {
++			return NativeEngineName
++		}
++	case "docx", "xlsx", "pptx", "html", "htm", "url":
++		return NativeEngineName
++	}
++	return ""
++}
+diff --git a/internal/infrastructure/docparser/native_reader.go b/internal/infrastructure/docparser/native_reader.go
+new file mode 100644
+--- /dev/null
++++ b/internal/infrastructure/docparser/native_reader.go
+@@ -0,0 +1,65 @@
++package docparser
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"strings"
++
++	"github.com/Tencent/WeKnora/internal/types"
++)
++
++// NativeReader handles PDF, Office and HTML files in-process on macOS/Lite.
++// Office and HTML conversion is pure Go; PDF delegates to the bundled pdf2md
++// helper (PDFKit + Vision OCR), so a desktop install needs no Python service.
++type NativeReader struct{}
++
++func (r *NativeReader) Read(ctx context.Context, req *types.ReadRequest) (*types.ReadResult, error) {
++	if req == nil {
++		return nil, fmt.Errorf("native parser: empty request")
++	}
++	if strings.TrimSpace(req.URL) != "" {
++		md, err := nativeURLToMarkdown(ctx, req.URL)
++		if err != nil {
++			return nil, err
++		}
++		return &types.ReadResult{MarkdownContent: md}, nil
++	}
++
++	ft := normalizeNativeType(req.FileType)
++	if ft == "" {
++		ft = strings.TrimPrefix(strings.ToLower(filepath.Ext(req.FileName)), ".")
++	}
++
++	var (
++		md  string
++		err error
++	)
++	switch ft {
++	case "pdf":
++		md, err = nativePDFToMarkdown(ctx, req)
++	case "doc":
++		md, err = nativeDOCToMarkdown(ctx, req.FileContent)
++	case "docx":
++		md, err = nativeDOCXToMarkdown(req.FileContent)
++	case "xlsx":
++		md, err = nativeXLSXToMarkdown(req.FileContent)
++	case "pptx":
++		md, err = nativePPTXToMarkdown(req.FileContent)
++	case "html", "htm":
++		md, err = nativeHTMLToMarkdown(req.FileContent)
++	default:
++		return nil, fmt.Errorf("native parser: unsupported file type %q", ft)
++	}
++	if err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(md) == "" {
++		return nil, fmt.Errorf("native parser: no text extracted from %s", ft)
++	}
++	return &types.ReadResult{MarkdownContent: md}, nil
++}
++
++func normalizeNativeType(fileType string) string {
++	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(fileType)), ".")
++}
+diff --git a/tools/pdf2md/pdf2md.swift b/tools/pdf2md/pdf2md.swift
+new file mode 100644
+--- /dev/null
++++ b/tools/pdf2md/pdf2md.swift
+@@ -0,0 +1,98 @@
++import Foundation
++import PDFKit
++import Vision
++import AppKit
++
++// pdf2md: 用 macOS 原生 PDFKit 抽取数字文本；无文字层的页面用 Vision OCR。
++// 输出 Markdown（按页分节）到 stdout；诊断信息写 stderr。
++
++func stderr(_ message: String) {
++    if let data = (message + "\n").data(using: .utf8) {
++        FileHandle.standardError.write(data)
++    }
++}
++
++func ocrText(from image: CGImage) throws -> String {
++    let request = VNRecognizeTextRequest()
++    request.recognitionLevel = .accurate
++    request.usesLanguageCorrection = true
++    request.recognitionLanguages = ["zh-Hans", "en-US"]
++
++    let handler = VNImageRequestHandler(cgImage: image, options: [:])
++    try handler.perform([request])
++
++    guard let observations = request.results else { return "" }
++    let lines: [(CGFloat, CGFloat, String)] = observations.compactMap { obs in
++        guard let candidate = obs.topCandidates(1).first else { return nil }
++        let box = obs.boundingBox
++        // Vision 的坐标原点在左下；-midY 让页面从上到下排序。
++        return (-box.midY, box.minX, candidate.string)
++    }.sorted { lhs, rhs in
++        if abs(lhs.0 - rhs.0) > 0.012 { return lhs.0 < rhs.0 }
++        return lhs.1 < rhs.1
++    }
++    return lines.map { $0.2 }.joined(separator: "\n")
++}
++
++func render(page: PDFPage, scale: CGFloat) -> CGImage? {
++    let bounds = page.bounds(for: .mediaBox)
++    let width = Int((bounds.width * scale).rounded())
++    let height = Int((bounds.height * scale).rounded())
++    guard width > 0, height > 0 else { return nil }
++    guard let context = CGContext(
++        data: nil,
++        width: width,
++        height: height,
++        bitsPerComponent: 8,
++        bytesPerRow: 0,
++        space: CGColorSpaceCreateDeviceRGB(),
++        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
++    ) else { return nil }
++
++    context.setFillColor(NSColor.white.cgColor)
++    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
++    context.scaleBy(x: scale, y: scale)
++    page.draw(with: .mediaBox, to: context)
++    return context.makeImage()
++}
++
++func main() -> Int32 {
++    let args = CommandLine.arguments
++    guard args.count >= 2 else {
++        stderr("用法: pdf2md <input.pdf>")
++        return 1
++    }
++    let url = URL(fileURLWithPath: args[1])
++    guard let document = PDFDocument(url: url) else {
++        stderr("无法打开 PDF: \(url.path)")
++        return 2
++    }
++    guard document.pageCount > 0 else {
++        stderr("PDF 没有页面: \(url.path)")
++        return 2
++    }
++
++    print("# \(url.lastPathComponent)\n")
++    var ocrPages = 0
++    for index in 0..<document.pageCount {
++        autoreleasepool {
++            guard let page = document.page(at: index) else { return }
++            let native = (page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
++            var text = native
++            if native.count < 10 {
++                if let image = render(page: page, scale: 2.0),
++                   let recognized = try? ocrText(from: image) {
++                    text = recognized.trimmingCharacters(in: .whitespacesAndNewlines)
++                    if !text.isEmpty { ocrPages += 1 }
++                }
++            }
++            print("## 第 \(index + 1) 页\n")
++            print(text.isEmpty ? "（本页无可提取文字）" : text)
++            print("\n")
++        }
++    }
++    stderr("页数: \(document.pageCount)，OCR 页数: \(ocrPages)")
++    return 0
++}
++
++exit(main())
