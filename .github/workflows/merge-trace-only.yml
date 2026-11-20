@@ -119,6 +119,16 @@ jobs:
           # Tracked modifications (engines.go, evaluation.go, jieba_cgo.go,
           # engine_registry_test.go, .gitattributes, existing files).
           git add -u
+          # Upstream merge touches official workflow files (app.yml etc.). The
+          # GITHUB_TOKEN lacks the 'workflows' scope, so GitHub refuses a push
+          # that updates any .github/workflows/* file. Those upstream CI tweaks
+          # are irrelevant to our merge result (our own workflows are separate),
+          # so unstage them before commit.
+          git diff --cached --name-only -- .github/workflows/ | while read -r wf; do
+            [ -z "$wf" ] && continue
+            git restore --staged "$wf"
+            echo "::notice::unstaged upstream workflow change: $wf"
+          done
           # New files introduced by the patches (explicit, no globbing over build dirs).
           git add internal/infrastructure/docparser/native_*.go
           git add tools/pdf2md/pdf2md.swift
