@@ -130,6 +130,19 @@ jobs:
           echo "native_*.go count: $(ls internal/infrastructure/docparser/native_*.go | wc -l | tr -d ' ')"
           echo "::notice::native patch applied (qoder-verify.yml absent)"
 
+      # 6b) G1 test-contract fix: drop the bogus "url" FileType (import gate
+      #     rejects it) and make the anydoc-default test build-tag aware via
+      #     preferredNativeEngine() as oracle. Applied after native patch so
+      #     the two a/ paths exist. --check guards context drift.
+      - name: Apply G1 test-contract fix
+        run: |
+          set -euo pipefail
+          git apply --check patches/g1-test-contract-fix.patch
+          git apply patches/g1-test-contract-fix.patch
+          grep -q 'func preferredNativeEngine' internal/infrastructure/docparser/native_pref_desktop.go
+          grep -q 'expected := func(ft, official string) string' internal/infrastructure/docparser/engine_registry_test.go
+          echo "::notice::G1 test-contract fix applied"
+
       # 7) Gates G1-G6. unified BUILD_TAGS throughout; any non-zero stops.
       - name: G1 - native unit tests
         run: go test -tags "$BUILD_TAGS" -count=1 ./internal/infrastructure/docparser
