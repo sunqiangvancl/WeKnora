@@ -27,7 +27,7 @@ env:
 
 jobs:
   merge-gate-package-release:
-    runs-on: macos-15
+    runs-on: macos-26-intel
     timeout-minutes: 90
     steps:
       # 1) Checkout the merge branch with full history (three-way merge needs
